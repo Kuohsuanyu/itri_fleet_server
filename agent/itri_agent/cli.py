@@ -153,18 +153,37 @@ def cmd_setup(args) -> int:
 
 def cmd_discover(args) -> int:
     cfg = cfgmod.load_config()
-    host = args.host or cfg["local"]["host"]
-    port = args.port or cfg["local"]["port"]
+    if getattr(args, "source", None):
+        cfg["source"] = args.source
+    source = cfgmod.resolve_source(cfg)
 
-    try:
-        stats = scan(host, int(port), seconds=args.seconds,
-                     username=cfg["local"].get("username"),
-                     password=cfg["local"].get("password"),
-                     subscribe=["#"], exclude=cfg.get("exclude") or [])
-    except (ConnectionError, OSError) as exc:
-        print(f"{RED}無法連上本地 broker {host}:{port}{RESET}: {exc}")
-        print("上位機上真的有 MQTT broker 嗎?用 --host/--port 指定其他位址。")
-        return 1
+    if source == "ros2":
+        from .ros2 import available, scan as ros_scan
+        usable, why = available()
+        if not usable:
+            print(f"{RED}無法使用 ROS 2{RESET}")
+            print(f"    {why}")
+            print(f"\n    先跑 {BOLD}itri-agent doctor{RESET} 看該怎麼裝。")
+            return 1
+        print(f"{DIM}來源:ROS 2{RESET}")
+        stats = ros_scan(seconds=args.seconds,
+                         exclude=cfg.get("exclude") or [],
+                         max_array=int(cfg.get("ros_max_array", 8)))
+    else:
+        host = args.host or cfg["local"]["host"]
+        port = args.port or cfg["local"]["port"]
+        print(f"{DIM}來源:本地 MQTT broker{RESET}")
+        try:
+            stats = scan(host, int(port), seconds=args.seconds,
+                         username=cfg["local"].get("username"),
+                         password=cfg["local"].get("password"),
+                         subscribe=["#"], exclude=cfg.get("exclude") or [])
+        except (ConnectionError, OSError) as exc:
+            print(f"{RED}無法連上本地 broker {host}:{port}{RESET}: {exc}")
+            print(f"上位機上真的有 MQTT broker 嗎?或改用 "
+                  f"{BOLD}itri-agent discover --source ros2{RESET}")
+            print(f"不確定的話跑 {BOLD}itri-agent doctor{RESET}。")
+            return 1
 
     if not stats:
         print(f"{YELLOW}沒有收到任何 topic。{RESET} 底盤程式有在發嗎?")
@@ -199,6 +218,7 @@ def cmd_discover(args) -> int:
           f"on_change_only={cfg['on_change_only']}){RESET}")
 
     cfg["include"] = chosen
+    cfg["source"] = source
     path = cfgmod.save_config(cfg)
     print(f"\n寫入 {path}")
     print(f"下一步:{BOLD}itri-agent run{RESET}")
@@ -213,6 +233,8 @@ def cmd_run(args) -> int:
         print(f"{RED}尚未登記{RESET} —— 先跑 `itri-agent enroll --server ... --token ...`")
         return 1
     cfg = cfgmod.load_config()
+    if getattr(args, "source", None):
+        cfg["source"] = args.source
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)-7s %(message)s",
                         datefmt="%H:%M:%S")
@@ -220,7 +242,10 @@ def cmd_run(args) -> int:
     inc = cfg.get("include") or []
     print(f"{BOLD}itri-agent{RESET}  {cred['robot_id']}  →  "
           f"{cred['mqtt']['host']}:{cred['mqtt']['port']}")
-    print(f"  本地 broker : {cfg['local']['host']}:{cfg['local']['port']}")
+    src = cfgmod.resolve_source(cfg)
+    where = ("ROS 2 圖譜" if src == "ros2"
+             else f"MQTT {cfg['local']['host']}:{cfg['local']['port']}")
+    print(f"  資料來源    : {where}")
     print(f"  轉發        : {len(inc) if inc else '全部'} 個 topic")
     print(f"  節流        : max {cfg['max_rate_hz']} Hz/topic, "
           f"on_change_only={cfg['on_change_only']}\n")
@@ -245,6 +270,11 @@ def cmd_run(args) -> int:
 
 
 # --------------------------------------------------------------------- status
+
+def cmd_doctor(args) -> int:
+    from .doctor import run
+    return run(as_json=args.as_json)
+
 
 def cmd_status(args) -> int:
     cred = cfgmod.load_credentials()
@@ -278,7 +308,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User={user}
-ExecStart={python} -m itri_agent run
+ExecStart={exec_start}
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
@@ -295,10 +325,36 @@ def cmd_install_service(args) -> int:
         return 1
     import getpass
     import os
+    from pathlib import Path as _P
     home_env = ""
     if os.environ.get("ITRI_AGENT_HOME"):
         home_env = f"Environment=ITRI_AGENT_HOME={os.environ['ITRI_AGENT_HOME']}"
-    unit = SYSTEMD_UNIT.format(user=getpass.getuser(), python=sys.executable,
+
+    # systemd starts with an empty environment. In ROS mode that is fatal and
+    # silent: rclpy lives on the PYTHONPATH that setup.bash exports, and its
+    # shared objects need setup.bash's LD_LIBRARY_PATH, so a unit that just
+    # runs the interpreter would fail to import at boot even though the same
+    # command works fine in the operator's shell. Source it inside the unit.
+    cfg = cfgmod.load_config()
+    if getattr(args, "source", None):
+        cfg["source"] = args.source
+    source = cfgmod.resolve_source(cfg)
+    exec_start = f"{sys.executable} -m itri_agent run"
+    if source == "ros2":
+        distro = os.environ.get("ROS_DISTRO")
+        if not distro:
+            found = (sorted(p.parent.name for p in _P("/opt/ros").glob("*/setup.bash"))
+                     if _P("/opt/ros").exists() else [])
+            distro = found[-1] if found else "humble"
+        setup = f"/opt/ros/{distro}/setup.bash"
+        if not _P(setup).exists():
+            print(f"{YELLOW}找不到 {setup}{RESET} —— unit 仍會產生,"
+                  f"但請先確認正確的 ROS 路徑再套用。")
+        exec_start = (f"/bin/bash -c 'source {setup} && "
+                      f"exec {sys.executable} -m itri_agent run'")
+        print(f"{DIM}ROS 模式:unit 會先 source {setup}{RESET}\n")
+
+    unit = SYSTEMD_UNIT.format(user=getpass.getuser(), exec_start=exec_start,
                                home_env=home_env)
     path = "/etc/systemd/system/itri-agent.service"
     print(unit)
@@ -331,6 +387,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.set_defaults(func=cmd_enroll)
 
     p = sub.add_parser("discover", help="即時列出本地所有 topic 並選擇要轉發哪些")
+    p.add_argument("--source", choices=("auto", "ros2", "mqtt"),
+                   help="資料來源;預設看 config 的 source(auto 會自動偵測)")
     p.add_argument("--host")
     p.add_argument("--port", type=int)
     p.add_argument("--seconds", type=float, default=0.0, help="0 = 直到 Ctrl-C")
@@ -338,12 +396,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.set_defaults(func=cmd_discover)
 
     p = sub.add_parser("run", help="開始轉發")
+    p.add_argument("--source", choices=("auto", "ros2", "mqtt"))
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("doctor", help="掃描這台機器,建議怎麼裝(不會改動任何東西)")
+    p.add_argument("--json", action="store_true", dest="as_json")
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("status", help="顯示目前設定與憑證")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("install-service", help="產生 systemd unit")
+    p.add_argument("--source", choices=("auto", "ros2", "mqtt"))
     p.set_defaults(func=cmd_install_service)
 
     args = ap.parse_args(argv)

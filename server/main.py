@@ -924,23 +924,65 @@ def agent_wheel() -> Optional[Path]:
 
 
 def install_command(base_url: str, token: str) -> Dict[str, Any]:
-    """The exact lines to paste on a new vehicle's onboard computer."""
+    """The exact lines to paste on a new vehicle's onboard computer.
+
+    Two variants, because the install path depends on where the data comes
+    from. A ROS 2 vehicle cannot use pipx: rclpy is not on PyPI, it comes from
+    apt under /opt/ros and is reachable only through the environment that
+    setup.bash exports, so the agent has to run from a venv created with
+    --system-site-packages *after* sourcing it. A vehicle with its own MQTT
+    broker has no such constraint and gets the fully isolated pipx install.
+
+    `itri-agent doctor` picks between them on the vehicle itself, so the
+    operator does not have to know which case they are in.
+    """
     wheel = agent_wheel()
-    steps = [
+    url = f"{base_url}/agent/{wheel.name}" if wheel else "itri-fleet-agent"
+    common = [
         "curl -fsSL https://tailscale.com/install.sh | sh",
         f"sudo tailscale up --authkey={TAILSCALE_AUTHKEY_HINT} --advertise-tags=tag:robot",
     ]
     # Raspberry Pi OS Bookworm and Debian 12 enforce PEP 668: pip refuses to
     # install into the system Python at all. pipx puts the CLI in its own
     # environment and still exposes `itri-agent` on PATH, which is what we want.
-    url = f"{base_url}/agent/{wheel.name}" if wheel else "itri-fleet-agent"
-    steps.append("sudo apt install -y pipx && pipx ensurepath")
-    steps.append(f"pipx install {url}")
-    steps.append(f"itri-agent enroll --server {base_url} --token {token}")
-    steps.append("itri-agent discover")
-    steps.append("itri-agent run")
-    return {"steps": steps, "oneliner": steps[-3],
-            "note": "Bookworm 之後 pip 不能裝進系統 Python(PEP 668),所以用 pipx"}
+    mqtt_steps = common + [
+        "sudo apt install -y pipx && pipx ensurepath",
+        f"pipx install {url}",
+        f"itri-agent enroll --server {base_url} --token {token}",
+        "itri-agent discover",
+        "itri-agent run",
+    ]
+    ros_steps = common + [
+        "source /opt/ros/$ROS_DISTRO/setup.bash",
+        "python3 -m venv --system-site-packages ~/.itri-venv",
+        f"~/.itri-venv/bin/pip install {url}",
+        f"~/.itri-venv/bin/itri-agent enroll --server {base_url} --token {token}",
+        "~/.itri-venv/bin/itri-agent discover --source ros2",
+        "~/.itri-venv/bin/itri-agent run",
+    ]
+    return {
+        "steps": mqtt_steps,                       # kept for older callers
+        "oneliner": mqtt_steps[-3],
+        "variants": [
+            {"id": "auto", "label": "先掃描這台機器(建議)",
+             "steps": common + [
+                 "sudo apt install -y pipx && pipx ensurepath",
+                 f"pipx install {url}",
+                 "itri-agent doctor",
+             ],
+             "note": "doctor 純讀取,會告訴你這台該用哪種安裝方式,"
+                     "以及會改動什麼、不會碰什麼"},
+            {"id": "mqtt", "label": "上位機有自己的 MQTT broker",
+             "steps": mqtt_steps,
+             "note": "完全隔離,不會動到系統 Python 的任何套件"},
+            {"id": "ros2", "label": "底盤走 ROS 2",
+             "steps": ros_steps,
+             "note": "rclpy 不在 PyPI,要靠 setup.bash 的 PYTHONPATH/LD_LIBRARY_PATH,"
+                     "所以每次執行前都要 source;開機自動啟動請用 "
+                     "`itri-agent install-service`,產生的 unit 會自己 source"},
+        ],
+        "note": "Bookworm 之後 pip 不能裝進系統 Python(PEP 668),所以用 pipx",
+    }
 
 
 @app.get("/api/admin/robots")

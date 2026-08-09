@@ -153,16 +153,44 @@ python tools\console.py --action funnel-off
 
 ### 車輛上位機(樹莓派等)
 
+**先讓它自己判斷該怎麼裝** —— 底盤走 ROS 2 和走本地 MQTT broker 的裝法不一樣:
+
 ```bash
 # 1. 加入 tailnet(broker 只聽 Tailscale 介面,這步不能跳)
 curl -fsSL https://tailscale.com/install.sh | sh
 sudo tailscale up --authkey=tskey-auth-XXXXX --advertise-tags=tag:robot
 
-# 2. 裝套件。Bookworm 起 pip 不能裝進系統 Python(PEP 668),用 pipx
+# 2. 掃描這台機器(純讀取,不改任何東西)
 sudo apt install -y pipx && pipx ensurepath
 pipx install https://<你的網址>/agent/latest.whl
+itri-agent doctor
+```
 
-# 3. 設定精靈:問你伺服器網址和授權碼,然後掃描本地 topic 讓你勾選
+`doctor` 會回報 Python、ROS 2、本地 broker、Tailscale、跟伺服器的連線,
+然後給一組指令,並明確列出**會改動什麼**和**不會碰什麼**。照著它給的走即可。
+
+<details>
+<summary>兩種資料來源的差別</summary>
+
+| | 走本地 MQTT broker | 走 ROS 2 |
+|---|---|---|
+| 裝法 | pipx(完全隔離) | venv `--system-site-packages` |
+| 為什麼 | 只需要 paho-mqtt | rclpy 不在 PyPI,是 apt 裝在 `/opt/ros` |
+| 執行前 | 不用做什麼 | 每次都要 `source /opt/ros/$ROS_DISTRO/setup.bash` |
+
+ROS 那個 source **不是裝一次就好**:rclpy 靠 `setup.bash` 匯出的 `PYTHONPATH`
+才找得到,它的 `.so` 也要 `LD_LIBRARY_PATH`。忘了 source 的典型症狀是
+「在我的 shell 跑得動,systemd 開機起不來」。`itri-agent install-service`
+在 ROS 模式下產生的 unit 會自己 source,所以照著做不會踩到。
+
+ROS 模式的三個坑已經處理:訂閱前先比對發佈端 QoS(感測器多半 BEST_EFFORT,
+用預設 RELIABLE 訂會**靜默收不到**)、大陣列只記長度(`/scan` 的 ranges
+不會變成幾百筆)、Image/PointCloud2/OccupancyGrid/TF 預設略過。
+
+</details>
+
+```bash
+# 3. 設定精靈:問你伺服器網址和授權碼,然後掃描 topic 讓你勾選
 itri-agent
 
 # 4. 開機自動啟動(重要,見下)
@@ -170,7 +198,7 @@ itri-agent install-service
 sudo systemctl enable --now itri-agent
 ```
 
-第 3 步的 `itri-agent discover` 會列出上位機本地 broker 上**所有**的 topic,
+第 3 步的 `discover` 會列出**所有**的 topic(ROS 或 MQTT 都一樣),
 即時跳動、依編號選取,並在選完後告訴你預估流量。
 **agent 不解析任何欄位** —— 換底盤廠牌不用改程式碼。
 

@@ -21,7 +21,7 @@ from typing import Any, Deque, Dict, List, Optional
 
 import paho.mqtt.client as mqtt
 
-from .config import should_relay
+from .config import resolve_source, should_relay
 from .discover import decode
 
 log = logging.getLogger("bridge")
@@ -52,6 +52,8 @@ class Bridge:
         self.field_of: Dict[str, str] = {
             topic: field for field, topic in (cfg.get("map") or {}).items() if topic
         }
+        self.source = resolve_source(cfg)
+        self._ros = None
 
         self.local = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
                                  client_id=f"itri-agent-{self.robot_id}")
@@ -82,22 +84,30 @@ class Bridge:
         log.info("subscribed to local broker: %s", ", ".join(self.cfg["subscribe"]))
 
     def _on_local_message(self, c, u, msg):
+        """MQTT path: decode the payload, then hand it to the common filter."""
+        if len(msg.payload) > int(self.cfg["max_payload_bytes"]):
+            self.seen += 1
+            self.skipped_big += 1
+            return
+        value, _is_bin = decode(msg.payload)
+        self.offer(msg.topic, time.time(), value)
+
+    def offer(self, topic: str, now: float, value: Any) -> None:
+        """Single filter path shared by the MQTT and ROS 2 sources.
+
+        Both sources produce (topic, timestamp, value); everything downstream --
+        rate limiting, change detection, buffering, field mapping -- is
+        identical, so neither source needs to know about the other.
+        """
         self.seen += 1
-        topic = msg.topic
         if not should_relay(topic, self.cfg.get("include") or [],
                             self.cfg.get("exclude") or []):
             return
-        if len(msg.payload) > int(self.cfg["max_payload_bytes"]):
-            self.skipped_big += 1
-            return
 
-        now = time.time()
         min_gap = 1.0 / max(float(self.cfg["max_rate_hz"]), 0.001)
         if now - self._last_at.get(topic, 0.0) < min_gap:
             self.skipped_rate += 1
             return
-
-        value, _is_bin = decode(msg.payload)
 
         if self.cfg.get("on_change_only"):
             prev = self._last.get(topic, _MISSING)
@@ -166,9 +176,18 @@ class Bridge:
     # ---------------------------------------------------------------- driver
 
     def run(self, on_tick=None) -> None:
-        lc = self.cfg["local"]
-        self.local.connect_async(lc["host"], int(lc["port"]), keepalive=30)
-        self.local.loop_start()
+        if self.source == "ros2":
+            from .ros2 import Ros2Source
+            self._ros = Ros2Source(
+                lambda t, ts, v: self.offer(t, ts, v),
+                include=self.cfg.get("include") or [],
+                exclude=self.cfg.get("exclude") or [],
+                max_array=int(self.cfg.get("ros_max_array", 8)))
+            self._ros.start()
+        else:
+            lc = self.cfg["local"]
+            self.local.connect_async(lc["host"], int(lc["port"]), keepalive=30)
+            self.local.loop_start()
 
         self.up.connect_async(self.cred["mqtt"]["host"], int(self.cred["mqtt"]["port"]),
                               keepalive=30)
@@ -189,7 +208,9 @@ class Bridge:
         finally:
             self.up.publish(f"fleet/{self.robot_id}/lwt", "offline", qos=1, retain=True)
             time.sleep(0.3)
-            for c in (self.local, self.up):
+            if getattr(self, "_ros", None):
+                self._ros.stop()
+            for c in ((self.up,) if self.source == "ros2" else (self.local, self.up)):
                 c.loop_stop()
                 try:
                     c.disconnect()

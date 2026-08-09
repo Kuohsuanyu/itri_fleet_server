@@ -21,6 +21,77 @@
                                             伺服器自動編目所有 topic
 ```
 
+## 先跑這個
+
+```bash
+itri-agent doctor
+```
+
+掃描這台機器(**純讀取,不改任何東西**),告訴你該用哪種安裝方式,
+並明確列出「會改動什麼 / 不會碰什麼」。
+
+```
+ROS 2
+  OK   已安裝:humble        ROS_DISTRO=humble
+  X    這個 Python 看不到 rclpy
+
+建議
+  偵測到 ROS 2(humble)但這個 Python 看不到 rclpy
+
+    source /opt/ros/humble/setup.bash
+    python3 -m venv --system-site-packages ~/.itri-venv
+    ~/.itri-venv/bin/pip install <wheel 網址>
+    ~/.itri-venv/bin/itri-agent --source ros2
+
+  會改動:
+    · 新建 ~/.itri-venv 這個資料夾
+    · 在那個 venv 內安裝 itri-fleet-agent 與 paho-mqtt
+
+  不會碰:
+    · 系統 Python 的套件(venv 只會「看到」不會「改」它們)
+    · ROS 2 安裝與 /opt/ros
+    · 既有的 paho-mqtt(venv 內的版本只在 agent 行程內生效)
+```
+
+---
+
+## 兩種資料來源
+
+| 來源 | 什麼時候用 | 安裝方式 |
+|---|---|---|
+| **ROS 2** | 底盤走 ROS 2 topic | venv `--system-site-packages`(要看得到 rclpy) |
+| **MQTT** | 上位機有本地 broker | pipx(完全隔離) |
+
+`config.yaml` 的 `source: auto` 會自己判斷 —— rclpy 能 import **而且** ROS 圖譜上
+真的有 topic 才選 ROS,否則退回 MQTT。裝了 ROS 但沒在跑的機器不會卡在空圖譜上。
+
+要強制指定:`itri-agent discover --source ros2` / `--source mqtt`。
+
+### ROS 2 模式做了什麼
+
+跟 MQTT 模式一樣 —— **不認識任何欄位**。訂閱整個圖譜、把訊息攤平成
+`topic/欄位/子欄位` 的純量往上送:
+
+```
+/odom  →  /odom/twist/twist/linear/x   = 0.62
+          /odom/twist/twist/angular/z  = 0.11
+          /odom/pose/pose/position/x   = 3.2
+          /odom/header/frame_id        = "odom"
+```
+
+三個 ROS 特有的坑已處理:
+
+| 坑 | 處理 |
+|---|---|
+| **QoS 不匹配會靜默收不到** —— 感測器多半 BEST_EFFORT 發佈,預設訂閱是 RELIABLE,訂了收不到還不報錯 | 先查發佈端 QoS 再照它訂 |
+| **陣列會爆炸** —— `/scan` 的 ranges 有幾百個 float | 超過 `ros_max_array`(預設 8)只記長度 |
+| **大型訊息** —— Image / PointCloud2 / OccupancyGrid / TF | 預設整個略過,要的話從 `include` 加回來 |
+
+另外 NaN/Inf 會被丟掉(不然進資料庫變成髒資料),遞迴深度上限 6 層,
+每 10 秒重新掃描一次圖譜(車子開機時 node 是陸續上線的)。
+
+---
+
 ## 安裝
 
 ```bash
@@ -28,12 +99,28 @@
 curl -fsSL https://tailscale.com/install.sh | sh
 sudo tailscale up --authkey=tskey-auth-XXXX --advertise-tags=tag:robot
 
-# 2. 裝套件(純 Python,ARM 上不用編譯)
-pip install itri-fleet-agent
+# 2. 裝套件
+sudo apt install -y pipx && pipx ensurepath
+pipx install https://<你的伺服器>/agent/latest.whl
 ```
 
-唯一的相依是 `paho-mqtt`。登記走標準函式庫的 `urllib`,樹莓派上不需要再裝 wheel。
-支援 Python 3.9 以上(Raspberry Pi OS Bullseye 內建 3.9 就能跑)。
+⚠️ **Raspberry Pi OS Bookworm / Debian 12 起不能直接 `pip install`** ——
+PEP 668 禁止 pip 寫入系統 Python,會回 `error: externally-managed-environment`。
+
+`pipx` 把 CLI 裝進獨立環境但仍然把 `itri-agent` 放到 PATH 上,是這種命令列工具的
+正確裝法。三種替代方案:
+
+| 方法 | 指令 | 適用 |
+|---|---|---|
+| **pipx**(建議) | `pipx install <url>` | CLI 工具的標準做法 |
+| venv | `python3 -m venv ~/.itri-venv && ~/.itri-venv/bin/pip install <url>` | 想完全掌控路徑 |
+| 強制 | `pip install --break-system-packages <url>` | 不建議,可能弄壞系統套件 |
+
+用 venv 的話後續指令要用 `~/.itri-venv/bin/itri-agent`,
+而 `install-service` 產生的 systemd unit 會自動指向正確的 Python(它用 `sys.executable`)。
+
+唯一的相依是 `paho-mqtt`(純 Python,ARM 不用編譯)。登記走標準函式庫的 `urllib`。
+支援 Python 3.9 以上(Bullseye 內建 3.9、Bookworm 3.11 都可以)。
 
 ## 三步驟上線
 

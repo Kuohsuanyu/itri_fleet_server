@@ -22,8 +22,20 @@ CONFIG_PATH = HOME / "config.json"
 CRED_PATH = HOME / "credentials.json"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    # Where the vehicle's data comes from.
+    #   auto  -> use ROS 2 if rclpy imports and the graph has topics,
+    #            otherwise fall back to the local MQTT broker
+    #   ros2  -> force ROS 2
+    #   mqtt  -> force the local MQTT broker
+    "source": "auto",
+
     # the vehicle's own broker -- whatever the chassis already publishes to
     "local": {"host": "127.0.0.1", "port": 1883, "username": None, "password": None},
+
+    # ROS 2 only. Arrays longer than this are recorded as a length, not
+    # expanded -- a LiDAR scan would otherwise become hundreds of rows per
+    # message and flatten the database.
+    "ros_max_array": 8,
 
     # Topics to relay. Empty list = relay everything matched by `subscribe`.
     # `itri-agent discover` writes this for you after you pick from the list.
@@ -112,3 +124,23 @@ def should_relay(topic: str, include: List[str], exclude: List[str]) -> bool:
     if not include:
         return True
     return any(topic_matches(f, topic) for f in include)
+
+
+def resolve_source(cfg: Dict[str, Any]) -> str:
+    """`auto` -> ros2 if the ROS graph is actually usable, else mqtt.
+
+    Deciding by "is rclpy importable" alone is not enough: a machine can have
+    ROS installed with nothing publishing, in which case the local broker is
+    the better guess. Only pick ros2 when there is a graph to read.
+    """
+    want = str(cfg.get("source", "auto")).lower()
+    if want in ("ros2", "mqtt"):
+        return want
+    import importlib.util
+    if importlib.util.find_spec("rclpy") is None:
+        return "mqtt"
+    try:
+        from .ros2 import _probe_graph
+        return "ros2" if _probe_graph() else "mqtt"
+    except Exception:
+        return "mqtt"

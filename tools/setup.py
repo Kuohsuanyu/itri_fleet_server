@@ -83,7 +83,7 @@ def bad(msg: str) -> None:
 # --------------------------------------------------------------------- steps
 
 def step_python() -> bool:
-    step(1, 8, "檢查 Python 與相依套件")
+    step(1, 9, "檢查 Python 與相依套件")
     v = sys.version_info
     if v < (3, 9):
         bad(f"Python {v.major}.{v.minor} 太舊,需要 3.9 以上")
@@ -161,7 +161,7 @@ def download_pg(dest: Path) -> Optional[Path]:
 
 
 def step_postgres() -> Optional[Tuple[Path, Path]]:
-    step(2, 8, "PostgreSQL")
+    step(2, 9, "PostgreSQL")
     pgbin = find_pg()
     if pgbin:
         ok(f"找到既有安裝:{pgbin}")
@@ -243,7 +243,7 @@ def port_open(host: str, port: int, t: float = 0.5) -> bool:
 
 
 def step_database(pgbin: Path, pgdata: Path) -> Optional[str]:
-    step(3, 8, "建立資料庫")
+    step(3, 9, "建立資料庫")
     stored = pgdata / "_itri_pw"
     pw = stored.read_text(encoding="ascii").strip() if stored.exists() else ""
     if not pw:
@@ -281,7 +281,7 @@ def gen_vapid() -> Tuple[str, str]:
 
 
 def step_config(dsn: str) -> Optional[dict]:
-    step(4, 8, "產生設定檔")
+    step(4, 9, "產生設定檔")
     if CONFIG.exists():
         warn(f"{CONFIG.name} 已存在")
         if not yes("要覆蓋嗎?(會先備份)", False):
@@ -318,7 +318,7 @@ def step_config(dsn: str) -> Optional[dict]:
 
 
 def step_tailscale() -> None:
-    step(5, 8, "Tailscale")
+    step(5, 9, "Tailscale")
     ts = shutil.which("tailscale") or r"C:\Program Files\Tailscale\tailscale.exe"
     if not Path(ts).exists():
         warn("找不到 Tailscale")
@@ -340,7 +340,7 @@ def step_tailscale() -> None:
 
 
 def step_schema() -> bool:
-    step(6, 8, "建立資料表")
+    step(6, 9, "建立資料表")
     r = subprocess.run([sys.executable, "-c",
                         "import asyncio,sys;sys.path.insert(0,'.');"
                         "from server.main import CFG;"
@@ -359,8 +359,37 @@ def step_schema() -> bool:
     return False
 
 
+def step_agent_wheel() -> None:
+    """Build the agent wheel so /agent/latest.whl exists.
+
+    The built wheel is gitignored -- it is a build artefact, and shipping one
+    in the repo would go stale the moment the agent changes. But the admin page
+    hands operators a `pip install <server>/agent/...whl` line, so on a fresh
+    clone that URL has to resolve to something. Build it here, once, at setup.
+    """
+    step(7, 9, "打包車端套件")
+    agent = ROOT / "agent"
+    if not (agent / "pyproject.toml").exists():
+        warn("找不到 agent/,略過。車端套件要另外提供給上位機。")
+        return
+    out = agent / "dist"
+    r = subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-deps",
+                        "-w", str(out), str(agent)],
+                       capture_output=True, text=True)
+    wheels = sorted(out.glob("itri_fleet_agent-*.whl"))
+    if r.returncode != 0 or not wheels:
+        warn("打包失敗,管理頁的安裝指令會指向不存在的網址。")
+        warn("之後可以自己補跑:python -m pip wheel --no-deps -w agent/dist agent")
+        tail = (r.stderr or r.stdout).strip().splitlines()[-3:]
+        for line in tail:
+            print(f"    {D}{line}{R}")
+        return
+    ok(f"{wheels[-1].name}  ({wheels[-1].stat().st_size / 1024:.0f} KB)")
+    print(f"    {D}上位機會從 <伺服器網址>/agent/{wheels[-1].name} 下載{R}")
+
+
 def step_verify(info: dict) -> None:
-    step(7, 8, "驗證")
+    step(8, 9, "驗證")
     say("  啟動伺服器測試 …")
     p = subprocess.Popen([sys.executable, "-m", "server.main"], cwd=str(ROOT),
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -391,7 +420,7 @@ def step_verify(info: dict) -> None:
 
 
 def step_done(info: dict) -> None:
-    step(8, 8, "完成")
+    step(9, 9, "完成")
     pw = info.get("password")
     say(f"""
   接下來:
@@ -433,6 +462,7 @@ def main() -> int:
     step_tailscale()
     if not step_schema():
         return 1
+    step_agent_wheel()
     step_verify(info)
     step_done(info)
     return 0
