@@ -11,6 +11,12 @@
 'use strict';
 
 window.ITRIShell = (() => {
+  // Admin pages answer only on the private listener. On the public one they
+  // 404, so the links are dropped rather than rendered dead -- a button that
+  // always fails reads as a broken site, not as a boundary.
+  // Defaults to hiding them: if /surface.js somehow did not load, showing
+  // fewer options is the failure that does not produce error pages.
+  const ADMIN_OK = !!(window.ITRI_SURFACE && window.ITRI_SURFACE.admin);
   const NAV = [
     ['/', '監控', '📊'],
     ['/admin/robots', '車輛', '🚚'],
@@ -18,7 +24,7 @@ window.ITRIShell = (() => {
     ['/admin/alerts', '預警', '🔔'],
     ['/admin/events', '事件', '📋'],
     ['/admin/system', '系統', '⚙'],
-  ];
+  ].filter(([href]) => ADMIN_OK || !href.startsWith('/admin'));
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 

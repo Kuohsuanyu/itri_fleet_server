@@ -159,6 +159,52 @@ def check_tailscale() -> Dict[str, Any]:
         return {"installed": True, "logged_in": False, "error": str(exc)}
 
 
+def check_clock() -> Dict[str, Any]:
+    """Is this vehicle's clock disciplined by anything?
+
+    Worth its own check because a wrong clock produces data that looks
+    completely normal. Nothing errors, nothing is missing -- the samples are
+    just filed under the wrong time, and you only find out when you try to
+    line up two vehicles during an incident and the story does not fit.
+
+    The server corrects for measured skew and records it, so the archive stays
+    usable either way. This check exists so the problem gets fixed at source
+    instead of being papered over on every batch, forever.
+    """
+    out: Dict[str, Any] = {"synced": None, "source": None, "detail": None}
+
+    # systemd-timesyncd / chrony / ntpd all report through timedatectl on any
+    # modern Debian or Ubuntu, which is what these boards run.
+    try:
+        r = subprocess.run(["timedatectl", "show", "--property=NTPSynchronized",
+                            "--property=NTP", "--value"],
+                           capture_output=True, text=True, timeout=6)
+        if r.returncode == 0:
+            vals = r.stdout.split()
+            out["source"] = "timedatectl"
+            out["synced"] = "yes" in [v.lower() for v in vals]
+            out["detail"] = " ".join(vals)
+            return out
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    try:
+        r = subprocess.run(["chronyc", "tracking"], capture_output=True,
+                           text=True, timeout=6)
+        if r.returncode == 0:
+            out["source"] = "chrony"
+            for line in r.stdout.splitlines():
+                if line.startswith("Leap status"):
+                    out["synced"] = "Normal" in line
+                if line.startswith("System time"):
+                    out["detail"] = line.split(":", 1)[1].strip()
+            return out
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    return out
+
+
 def check_server(cred: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not cred:
         return {"enrolled": False}
@@ -289,6 +335,7 @@ def run(as_json: bool = False) -> int:
     ros = check_ros()
     broker = check_mqtt_broker()
     ts = check_tailscale()
+    clock = check_clock()
     paho = check_paho()
     cred = cfgmod.load_credentials()
     srv = check_server(cred)
@@ -296,7 +343,8 @@ def run(as_json: bool = False) -> int:
 
     if as_json:
         print(json.dumps({"python": py, "pep668": pep, "ros2": ros,
-                          "mqtt_broker": broker, "tailscale": ts, "paho": paho,
+                          "mqtt_broker": broker, "tailscale": ts,
+                          "clock": clock, "paho": paho,
                           "server": srv, "recommendation": rec},
                          indent=2, ensure_ascii=False, default=str))
         return 0 if rec["source"] != "none" else 1
@@ -350,6 +398,20 @@ def run(as_json: bool = False) -> int:
         _ok(f"{broker['host']}:{broker['port']} 有在聽")
     else:
         _info("127.0.0.1:1883 沒有 broker")
+
+    print(f"\n{B}時鐘{R}")
+    print(f"{D}  本機時間 {time.strftime('%Y-%m-%d %H:%M:%S %Z')}{R}")
+    if clock["synced"] is True:
+        _ok(f"時間有在同步({clock['source']})", clock["detail"] or "")
+    elif clock["synced"] is False:
+        _warn(f"時間**沒有**在同步({clock['source']})", "資料會被歸到錯的時間點")
+        print(f"{D}       修法:sudo timedatectl set-ntp true{R}")
+        print(f"{D}       或:  sudo apt install -y chrony{R}")
+        print(f"{D}       伺服器會量到偏差並自動校正,但校正是補救不是解法 ——{R}")
+        print(f"{D}       跨車比對事故時間軸,還是要車子自己的時間是對的。{R}")
+    else:
+        _info("查不到時間同步狀態(沒有 timedatectl 也沒有 chrony)")
+        print(f"{D}       長期運行的車輛建議裝 chrony{R}")
 
     print(f"\n{B}Tailscale{R}")
     if not ts.get("installed"):

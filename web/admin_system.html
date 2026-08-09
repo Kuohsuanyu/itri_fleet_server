@@ -62,9 +62,27 @@
     <div class="eg"><div class="eg-v" id="m-acl">–</div><div class="eg-k">ACL 拒絕</div></div>
     <div class="eg"><div class="eg-v" id="m-buf">–</div><div class="eg-k">寫入緩衝</div></div>
     <div class="eg"><div class="eg-v" id="m-drop">–</div><div class="eg-k">丟失</div></div>
+    <div class="eg"><div class="eg-v" id="m-dup">–</div><div class="eg-k">重送擋下</div></div>
+    <div class="eg"><div class="eg-v" id="m-old">–</div><div class="eg-k">未升級 agent</div></div>
+    <div class="eg"><div class="eg-v" id="m-disk">–</div><div class="eg-k">磁碟剩餘</div></div>
+    <div class="eg"><div class="eg-v" id="m-clock">–</div><div class="eg-k">時鐘不同步</div></div>
+  </div>
+
+  <div class="card" id="clock-card" hidden>
+    <h2>車輛時鐘偏差</h2>
+    <p class="hint">
+      時間戳在寫入前已依這個偏差校正,所以資料仍然可用 —— 但校正是補救。
+      跨車比對事故時間軸要準,還是要車上的 NTP 是對的。
+      在車上跑 <code>itri-agent doctor</code> 會指出怎麼修。
+    </p>
+    <table class="tbl">
+      <thead><tr><th>車輛</th><th>偏差</th><th>方向</th></tr></thead>
+      <tbody id="clock-body"></tbody>
+    </table>
   </div>
 </section>
 <script src="/static/push.js"></script>
+<script src="/surface.js"></script>
 <script src="/static/shell.js"></script>
 <script src="/static/admin_common.js"></script>
 <script src="/static/admin_system.js"></script>

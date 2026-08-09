@@ -19,8 +19,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections import OrderedDict
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 
 import paho.mqtt.client as mqtt
 
@@ -40,7 +41,7 @@ class TelemetryRouter:
     def __init__(self, state: FleetState,
                  on_sample: Optional[Callable[[object], None]] = None,
                  on_presence: Optional[Callable[[str, bool], None]] = None,
-                 on_raw: Optional[Callable[[str, list], None]] = None,
+                 on_raw: Optional[Callable[[str, list, Optional[float]], None]] = None,
                  dedup_window: int = 4096):
         self.state = state
         self.on_sample = on_sample
@@ -60,6 +61,10 @@ class TelemetryRouter:
         self.duplicates = 0
         self.duplicate_samples = 0
         self.unversioned = 0        # batches from agents predating the envelope
+
+        # robot_id -> (vehicle clock - server clock), seconds. Populated from
+        # the batch envelope; None for agents that do not send one.
+        self.last_skew: Dict[str, float] = {}
 
     def handle(self, topic: str, payload: bytes) -> None:
         parts = topic.split("/")
@@ -145,10 +150,24 @@ class TelemetryRouter:
             else:
                 self.unversioned += 1
 
+        # Clock skew, measured once per batch rather than per row.
+        #
+        # Per row would be wrong: after an uplink outage the agent flushes
+        # samples that are legitimately hours old, and those would read as
+        # enormous drift. The envelope's `ts` is stamped at send time (the
+        # agent does not even build an envelope while the uplink is down), so
+        # envelope-vs-arrival isolates the clock difference from the backlog.
+        skew = None
+        if isinstance(data, dict):
+            sent = data.get("ts")
+            if isinstance(sent, (int, float)):
+                skew = float(sent) - time.time()
+                self.last_skew[robot_id] = skew
+
         self.raw_batches += 1
         self.raw_samples += len(batch)
         if self.on_raw:
-            self.on_raw(robot_id, batch)
+            self.on_raw(robot_id, batch, skew)
 
 
 class MqttIngest:

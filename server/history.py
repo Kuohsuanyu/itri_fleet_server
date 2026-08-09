@@ -64,7 +64,10 @@ class TelemetryWriter:
                  buffer_max: int = 200_000, event_buffer_max: int = 20_000,
                  topic_buffer_max: int = 400_000,
                  disk_warn_pct: float = 15.0, disk_critical_pct: float = 5.0,
-                 maintenance_interval: float = 3600.0):
+                 maintenance_interval: float = 3600.0,
+                 clock_correct_s: float = 2.0,
+                 max_backfill_s: float = 7 * 86400.0,
+                 max_future_s: float = 300.0):
         self.db = db
         self.flush_interval = max(float(flush_interval), 0.2)
         self.buffer: Deque[tuple] = deque(maxlen=buffer_max)
@@ -91,6 +94,13 @@ class TelemetryWriter:
         self.disk: Dict[str, Any] = {}
         self.emergency_drops = 0
         self._disk_warned = False
+
+        self.clock_correct_s = float(clock_correct_s)
+        self.max_backfill_s = float(max_backfill_s)
+        self.max_future_s = float(max_future_s)
+        self.skew: Dict[str, float] = {}
+        self._skew_warned: set[str] = set()
+        self.clamped = 0
 
     # ------------------------------------------------------------- recording
 
@@ -123,7 +133,8 @@ class TelemetryWriter:
             elif prev is not None:
                 self.note_event(robot.id, "error", {"cleared": True}, "info")
 
-    def record_topics(self, robot_id: str, batch: list) -> None:
+    def record_topics(self, robot_id: str, batch: list,
+                      skew: Optional[float] = None) -> None:
         """A relayed batch: [[topic, ts, value, flag], ...] (flag optional).
 
         Values arrive as whatever the source published. A bare number is stored
@@ -133,10 +144,22 @@ class TelemetryWriter:
         flag 0 = the value changed, 1 = an unchanged value resent as a
         heartbeat. Storing it is what lets a query distinguish "this reading
         has not moved" from "this sensor stopped reporting" -- with
-        on_change_only those look identical otherwise. Rows from agents that
-        predate the flag are recorded as changes, which is what they were.
+        on_change_only those look identical otherwise.
+
+        `skew` is (vehicle clock - server clock) for this batch, measured by
+        the router. Timestamps are corrected by it before storage; see
+        _correct() for why that is not optional.
         """
         now = time.time()
+        recv = _ts(now)
+        correction = 0.0
+        if skew is not None and abs(skew) >= self.clock_correct_s:
+            correction = skew
+            self._note_skew(robot_id, skew)
+        skew_ms = int(skew * 1000) if skew is not None else None
+        if skew_ms is not None:
+            skew_ms = max(-2_147_483_648, min(2_147_483_647, skew_ms))
+
         for item in batch:
             try:
                 topic, ts, value = item[0], item[1], item[2]
@@ -151,20 +174,67 @@ class TelemetryWriter:
             except (TypeError, ValueError):
                 flag = 0
 
+            try:
+                raw_ts = float(ts) if ts else now
+            except (TypeError, ValueError):
+                raw_ts = now
+            stamp = self._correct(raw_ts, correction, now)
+
             num = _numeric(value)
 
             if len(self.topics) == self.topics.maxlen:
                 self.dropped += 1
-            self.topics.append((robot_id, _ts(float(ts) if ts else now),
+            self.topics.append((robot_id, _ts(stamp), recv, skew_ms,
                                 topic[:500], num, Jsonb(value), flag))
 
             seen = self._catalog.setdefault((robot_id, topic[:500]),
                                             [0, "", 0.0, 0.0])
             seen[0] += 1
             seen[1] = str(value)[:200]
-            seen[2] = float(ts) if ts else now                 # last_seen
+            seen[2] = stamp                                    # last_seen
             if flag == 0:
-                seen[3] = float(ts) if ts else now             # last_changed
+                seen[3] = stamp                                # last_changed
+
+    def _correct(self, raw_ts: float, correction: float, now: float) -> float:
+        """Map a vehicle timestamp onto the server's timeline.
+
+        Two separate jobs, and they are easy to conflate:
+
+        1. Subtracting the measured skew lines up 50 vehicles whose clocks
+           disagree. Without it, "what happened across the fleet at 14:32" is
+           unanswerable -- each robot means a different 14:32. Subtracting
+           rather than replacing preserves the relative spacing within a
+           batch and keeps genuine backfill (samples buffered during an
+           outage) at its real age.
+
+        2. The hard clamp is not about accuracy, it is about the partition
+           key. `ts` decides which daily partition a row lands in. A robot
+           whose clock reads 2031 sends rows outside every managed range, so
+           they fall into the DEFAULT partition -- which retention skips,
+           because dropping it would break inserts. Those rows then live
+           forever. One misconfigured vehicle silently defeats the whole
+           retention design, and nothing looks wrong until the disk fills.
+        """
+        stamp = raw_ts - correction
+        floor = now - self.max_backfill_s
+        ceiling = now + self.max_future_s
+        if stamp < floor or stamp > ceiling:
+            self.clamped += 1
+            return now
+        return stamp
+
+    def _note_skew(self, robot_id: str, skew: float) -> None:
+        """One event per robot per crossing, not one per batch."""
+        self.skew[robot_id] = skew
+        if robot_id in self._skew_warned:
+            return
+        self._skew_warned.add(robot_id)
+        log.warning("%s clock is %.1fs %s the server -- timestamps corrected, "
+                    "but fix NTP on the vehicle", robot_id, abs(skew),
+                    "ahead of" if skew > 0 else "behind")
+        self.note_event(robot_id, "clock",
+                        {"msg": "車輛時鐘與伺服器不同步,時間戳已校正",
+                         "skew_s": round(skew, 2)}, "warning")
 
     def note_event(self, robot_id: Optional[str], kind: str,
                    detail: Optional[Dict[str, Any]] = None,
@@ -319,6 +389,11 @@ class TelemetryWriter:
             "db_ready": self.db.ready,
             "db_error": self.db.last_error,
             "disk": self.disk,
+            # Vehicles whose clock differs from the server's by more than
+            # clock_correct_s. Their timestamps are corrected on the way in,
+            # but the underlying NTP problem is theirs to fix.
+            "clock_skew": {k: round(v, 2) for k, v in self.skew.items()},
+            "clock_clamped": self.clamped,
             "disk_warn_pct": self.disk_warn_pct,
             "disk_critical_pct": self.disk_critical_pct,
             "emergency_drops": self.emergency_drops,

@@ -276,6 +276,19 @@ class Database:
                 if part_day < cutoff:
                     conn.execute(f"DROP TABLE IF EXISTS {name}")
                     dropped.append(name)
+
+            # The DEFAULT partition catches anything outside every daily
+            # range, and the regex above deliberately skips it -- dropping it
+            # would break inserts. But that means rows landing there were
+            # exempt from retention forever. `ts` is now clamped so this
+            # should stay empty; sweep it anyway, because "should stay empty"
+            # is exactly the assumption that quietly stops being true.
+            for parent in self.PARTITIONED:
+                n = conn.execute(
+                    f"DELETE FROM {parent}_default WHERE ts < %s", (cutoff,)
+                ).rowcount
+                if n:
+                    dropped.append(f"{parent}_default({n} 列)")
         return dropped
 
     async def drop_expired_partitions(self) -> List[str]:
@@ -307,10 +320,11 @@ class Database:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 with cur.copy("COPY topic_samples"
-                              " (robot_id, ts, topic, num, payload, flag)"
+                              " (robot_id, ts, recv_ts, skew_ms,"
+                              "  topic, num, payload, flag)"
                               " FROM STDIN (FORMAT BINARY)") as cp:
-                    cp.set_types(["text", "timestamptz", "text", "real",
-                                  "jsonb", "int2"])
+                    cp.set_types(["text", "timestamptz", "timestamptz", "int4",
+                                  "text", "real", "jsonb", "int2"])
                     for row in rows:
                         cp.write_row(row)
         return len(rows)

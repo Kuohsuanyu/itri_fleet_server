@@ -48,6 +48,34 @@ TAILSCALE = Path(os.environ.get("ITRI_TAILSCALE")
                  or r"C:\Program Files\Tailscale\tailscale.exe")
 PORT = int(CFG.get("http", {}).get("port", 8080))
 BASE = f"http://127.0.0.1:{PORT}"
+PRIV_PORT = int(CFG.get("http", {}).get("private_port") or 0)
+
+
+def _tailscale_ip() -> str:
+    import socket
+    for a in socket.gethostbyname_ex(socket.gethostname())[2]:
+        if a.startswith("100."):
+            return a
+    return ""
+
+
+def _admin_url() -> str:
+    """Where /admin actually answers.
+
+    Admin moved to a listener bound to the Tailscale address, so the obvious
+    guess -- the public URL plus /admin -- now 404s. The console is the place
+    an operator looks for this, so it has to say it rather than assume they
+    remember.
+    """
+    if not PRIV_PORT:
+        return f"{BASE}/admin/robots"        # single-listener mode
+    host = CFG.get("http", {}).get("private_host") or "127.0.0.1"
+    if str(host).lower() == "tailscale":
+        host = _tailscale_ip() or "127.0.0.1"
+    return f"http://{host}:{PRIV_PORT}/admin/robots"
+
+
+ADMIN_URL = _admin_url()
 PASSWORD = os.environ.get("FLEET_PASSWORD") or CFG.get("http", {}).get("password") or ""
 
 
@@ -152,6 +180,12 @@ def collect() -> Dict[str, Any]:
     s["fleetsim_pids"] = find(SERVICES["fleet"])
     s["agent_pids"] = find(SERVICES["agent"])
     s["http"] = port_open("127.0.0.1", 8080)
+    s["admin"] = False
+    s["admin_code"] = None
+    if PRIV_PORT:
+        code, _ = http(f"{ADMIN_URL.rsplit('/admin', 1)[0]}/healthz", timeout=3)
+        s["admin_code"] = code
+        s["admin"] = code == 200
     bind = str(CFG.get("mqtt", {}).get("bind", "0.0.0.0"))
     probe = "127.0.0.1" if bind in ("0.0.0.0", "tailscale", "") else bind
     s["mqtt"] = port_open(probe, 1883) or port_open("127.0.0.1", 1883)
@@ -220,7 +254,16 @@ def render(s: Dict[str, Any]) -> str:
 
     pc = s["public_code"]
     row("外網可達", badge(pc == 200, f"HTTP {pc}", f"HTTP {pc}" if pc else "連不到"),
-        "任何人都能開" if pc == 200 else "")
+        "任何人都能開(只有儀表板)" if pc == 200 else "")
+
+    if PRIV_PORT:
+        row("管理面(私有)", badge(s["admin"], f"HTTP {s['admin_code'] or '-'}",
+                                 "連不到"),
+            ADMIN_URL)
+        add(f"   {D}{'':18}{'':16} 公開網址加 /admin 會回 404 —— 那是正確的{R}")
+    else:
+        row("管理面", f"{YEL}與儀表板同一個 port{R}",
+            "設定 http.private_port 才會分開")
 
     add("")
     for key, label in (("chassis_pids", "模擬底盤"), ("fleetsim_pids", "模擬車隊"),
@@ -491,7 +534,8 @@ MENU = f"""
    {B}1{R} 啟動全部        {B}2{R} 停止全部        {B}r{R} 重新整理
    {B}3{R} 資料庫 開/關    {B}4{R} 伺服器 開/關    {B}5{R} 外網 開/關
    {B}6{R} 模擬環境 開/關  {B}7{R} 清除重複行程    {B}8{R} 開啟儀表板
-   {B}9{R} 檢視 log        {B}t{R} 執行測試        {B}w{R} 持續監看
+   {B}a{R} 開啟管理頁      {B}9{R} 檢視 log        {B}t{R} 執行測試
+   {B}w{R} 持續監看
    {B}d{R} 開啟 pgAdmin    {B}s{R} 快速 SQL 查詢
    {B}q{R} 離開(不會關掉任何服務)
 """
@@ -596,6 +640,9 @@ def main() -> int:
             url = PUBLIC if st["public_code"] == 200 else BASE
             os.startfile(url) if hasattr(os, "startfile") else None
             note = f"已開啟 {url}"
+        elif c == "a":
+            os.startfile(ADMIN_URL) if hasattr(os, "startfile") else None
+            note = f"已開啟管理頁 {ADMIN_URL}"
         elif c == "9":
             which = input("   哪一個? server / agent / chassis / pg > ").strip() or "server"
             clear()
@@ -603,7 +650,8 @@ def main() -> int:
             input("\n   按 Enter 返回 ")
         elif c == "t":
             clear()
-            for script in ("tools/test_enroll.py", "tools/test_broker_acl.py"):
+            for script in ("tools/test_protocol.py", "tools/test_broker_fuzz.py",
+                           "tools/test_enroll.py", "tools/test_broker_acl.py"):
                 if (ROOT / script).exists():
                     print(f"\n{B}--- {script} ---{R}")
                     subprocess.run([sys.executable, script], cwd=str(ROOT))

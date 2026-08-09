@@ -101,7 +101,8 @@ check("reap 回報變化", "r4" not in fs.reap())
 section("6. QoS 1 重送去重(robot_id + boot_id + seq)")
 
 got = []
-router = TelemetryRouter(FleetState(), on_raw=lambda rid, b: got.append((rid, b)))
+router = TelemetryRouter(FleetState(),
+                         on_raw=lambda rid, b, skew=None: got.append((rid, b, skew)))
 
 
 def send(rid, boot, seq, rows):
@@ -146,9 +147,101 @@ for i in range(500):
 check("視窗被裁切到上限", len(small._recent) <= 64, f"-> {len(small._recent)}")
 check("沒有誤判成重複", small.duplicates == 0, f"-> {small.duplicates}")
 
+# ------------------------------------------------------------- clock skew
+
+section("10. 車輛時鐘偏差(每批量測一次,不是每列)")
+
+seen = []
+r2 = TelemetryRouter(FleetState(),
+                     on_raw=lambda rid, b, skew=None: seen.append(skew))
+
+now = time.time()
+r2.handle("fleet/c1/samples", json.dumps(
+    {"v": 1, "id": "c1", "boot": "b", "seq": 1, "ts": now,
+     "b": [["t", now, 1, 0]]}).encode())
+check("時鐘同步的車:偏差 ≈ 0", abs(seen[-1]) < 2.0, f"-> {seen[-1]:.2f}s")
+
+r2.handle("fleet/c2/samples", json.dumps(
+    {"v": 1, "id": "c2", "boot": "b", "seq": 1, "ts": now + 300,
+     "b": [["t", now + 300, 1, 0]]}).encode())
+check("時鐘快 5 分鐘的車被量到", 290 < seen[-1] < 310, f"-> {seen[-1]:.0f}s")
+check("偏差記在 last_skew", "c2" in r2.last_skew)
+
+# ★ 這一項是重點:斷線後補傳的資料「舊」是正常的,不是時鐘歪掉。
+#   偏差用信封的 ts(送出當下)量,不是用每一列的 ts。
+r2.handle("fleet/c3/samples", json.dumps(
+    {"v": 1, "id": "c3", "boot": "b", "seq": 1, "ts": now,
+     "b": [["t", now - 7200, 1, 0], ["t", now - 3600, 2, 0]]}).encode())
+check("★ 斷線兩小時後補傳,不會被誤判成時鐘偏差",
+      abs(seen[-1]) < 2.0, f"-> {seen[-1]:.2f}s")
+
+check("舊 agent(信封沒有 ts)-> skew=None", True)
+r2.handle("fleet/c4/samples", json.dumps({"b": [["t", now, 1]]}).encode())
+check("沒有信封時 skew 是 None", seen[-1] is None, f"-> {seen[-1]}")
+
+
+# --------------------------------------------------- clock correction
+
+section("11. 時間戳校正與分割鍵夾限")
+
+from server.history import TelemetryWriter          # noqa: E402
+
+w = TelemetryWriter(None, clock_correct_s=2.0,
+                    max_backfill_s=7 * 86400, max_future_s=300)
+base = time.time()
+
+w.record_topics("ok1", [["t/a", base, 1, 0]], skew=0.3)
+row = w.topics[-1]
+check("偏差在門檻內 -> 不動時間戳",
+      abs(row[1].timestamp() - base) < 0.01, f"-> 差 {row[1].timestamp()-base:.3f}s")
+check("recv_ts 有記錄", row[2] is not None)
+check("skew_ms 有記錄", row[3] == 300, f"-> {row[3]}")
+
+w.topics.clear()
+w.record_topics("fast", [["t/a", base + 300, 1, 0]], skew=300.0)
+row = w.topics[-1]
+check("★ 時鐘快 5 分鐘 -> 校正回伺服器時間軸",
+      abs(row[1].timestamp() - base) < 1.0,
+      f"-> 差 {row[1].timestamp()-base:.1f}s")
+check("原始時間可回推(ts + skew_ms)",
+      abs(row[1].timestamp() + row[3] / 1000 - (base + 300)) < 1.0)
+check("偏差被記錄", "fast" in w.skew)
+check("寫了一筆 clock 事件", any(e[2] == "clock" for e in w.events))
+
+w.topics.clear()
+n_before = w.clamped
+w.record_topics("insane", [["t/a", base + 10 * 365 * 86400, 1, 0]], skew=None)
+row = w.topics[-1]
+check("★ 時鐘寫著 10 年後 -> 夾到現在(否則會掉進 default 分割)",
+      abs(row[1].timestamp() - base) < 5.0,
+      f"-> {row[1].isoformat()}")
+check("夾限有計數", w.clamped == n_before + 1)
+
+w.topics.clear()
+w.record_topics("backfill", [["t/a", base - 3600, 1, 0]], skew=0.1)
+row = w.topics[-1]
+check("★ 斷線一小時的補傳資料保留原本的時間(不是錯誤)",
+      abs(row[1].timestamp() - (base - 3600)) < 1.0,
+      f"-> 差 {row[1].timestamp()-(base-3600):.1f}s")
+
+w.topics.clear()
+w.record_topics("ancient", [["t/a", base - 30 * 86400, 1, 0]], skew=None)
+check("超過 max_backfill 的資料被夾到現在",
+      abs(w.topics[-1][1].timestamp() - base) < 5.0)
+
+w.topics.clear()
+w._skew_warned.clear()
+w.events.clear()
+for i in range(5):
+    w.record_topics("noisy", [["t/a", base, 1, 0]], skew=100.0)
+check("同一台車只警告一次,不是每批都吵",
+      sum(1 for e in w.events if e[2] == "clock") == 1,
+      f"-> {sum(1 for e in w.events if e[2] == 'clock')} 筆事件")
+
+
 # ------------------------------------------------------------------- ACL
 
-section("10. ACL:只能發佈,不能訂閱")
+section("12. ACL:只能發佈,不能訂閱")
 
 t = Registry.topic_allowed
 check("可發佈自己的 samples", t("carA", "fleet/carA/samples", "publish"))

@@ -55,6 +55,31 @@ async function loadMetrics() {
   let d;
   try { d = await api('/api/metrics'); } catch { return; }
   const m = d.mqtt, b = m.broker_stats || {}, h = d.history || {};
+
+  // QoS 1 redeliveries caught before they reached the archive. A number that
+  // keeps climbing means the uplink is flapping.
+  $('m-dup').textContent = (m.duplicate_batches || 0).toLocaleString();
+  // Agents predating the batch envelope. Those batches cannot be deduplicated.
+  $('m-old').textContent = (m.unversioned_batches || 0).toLocaleString();
+  const disk = h.disk || {};
+  $('m-disk').textContent = disk.free_pct != null ? disk.free_pct + '%' : '–';
+
+  // Vehicles whose clock disagrees with the server's.
+  const skew = m.clock_skew_s || {};
+  const bad = Object.entries(skew).filter(([, v]) => Math.abs(v) >= 2);
+  $('m-clock').textContent = bad.length;
+  const card = $('clock-card'), body = $('clock-body');
+  if (card && body) {
+    card.hidden = bad.length === 0;
+    body.innerHTML = '';
+    for (const [id, v] of bad.sort((a, b2) => Math.abs(b2[1]) - Math.abs(a[1]))) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td class="mono">${esc(id)}</td>` +
+        `<td class="mono">${Math.abs(v).toFixed(1)} s</td>` +
+        `<td>${v > 0 ? '車子比伺服器快' : '車子比伺服器慢'}</td>`;
+      body.appendChild(tr);
+    }
+  }
   $('e-rate').textContent = fmtBytes(d.rate_bps) + '/s';
   $('e-total').textContent = fmtBytes(d.total_bytes);
   $('e-month').textContent = d.projected_gb_month + ' GB';

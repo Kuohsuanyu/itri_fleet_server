@@ -73,7 +73,20 @@ CREATE TABLE IF NOT EXISTS telemetry_default PARTITION OF telemetry DEFAULT;
 -- charting reads one indexed column instead of extracting from jsonb.
 CREATE TABLE IF NOT EXISTS topic_samples (
     robot_id  text        NOT NULL,
+    -- The sample's time on the SERVER's clock. Derived from the vehicle's
+    -- timestamp, corrected by the batch's measured clock skew, and hard
+    -- clamped to a sane window. This is the partition key, so it must never
+    -- be attacker- or bug-controlled: a robot whose clock reads 2031 would
+    -- otherwise put rows in the DEFAULT partition, which retention never
+    -- drops -- unbounded growth, silently.
     ts        timestamptz NOT NULL,
+    -- When the server actually received the batch. Always trustworthy,
+    -- because it never leaves this machine. Use this to correlate events
+    -- across vehicles; `ts` is best-effort, this is ground truth.
+    recv_ts   timestamptz NOT NULL DEFAULT now(),
+    -- (vehicle clock - server clock) in ms, measured per batch. The
+    -- uncorrected vehicle timestamp is always recoverable as ts + skew_ms.
+    skew_ms   integer,
     topic     text        NOT NULL,
     num       real,
     payload   jsonb,
@@ -182,7 +195,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     key   text PRIMARY KEY,
     value text NOT NULL
 );
-INSERT INTO schema_meta (key, value) VALUES ('version', '2')
+INSERT INTO schema_meta (key, value) VALUES ('version', '3')
     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 
@@ -201,3 +214,10 @@ INSERT INTO schema_meta (key, value) VALUES ('version', '2')
 -- v2: distinguish a value that changed from one resent as a heartbeat.
 ALTER TABLE topic_samples ADD COLUMN IF NOT EXISTS flag smallint NOT NULL DEFAULT 0;
 ALTER TABLE topic_catalog ADD COLUMN IF NOT EXISTS last_changed timestamptz;
+
+-- v3: vehicle clocks are not trustworthy. Keep the server's own receive time
+-- next to the vehicle's, and record how far apart they were.
+ALTER TABLE topic_samples ADD COLUMN IF NOT EXISTS recv_ts timestamptz NOT NULL DEFAULT now();
+ALTER TABLE topic_samples ADD COLUMN IF NOT EXISTS skew_ms integer;
+ALTER TABLE robots        ADD COLUMN IF NOT EXISTS clock_skew_ms integer;
+ALTER TABLE robots        ADD COLUMN IF NOT EXISTS clock_checked_at timestamptz;

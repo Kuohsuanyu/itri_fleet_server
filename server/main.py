@@ -228,14 +228,15 @@ router = TelemetryRouter(
     state,
     on_sample=lambda robot: writer.record(robot) if writer else None,
     on_presence=lambda rid, up: writer.note_presence(rid, up) if writer else None,
-    on_raw=lambda rid, batch: _on_raw_batch(rid, batch),
+    on_raw=lambda rid, batch, skew=None: _on_raw_batch(rid, batch, skew),
 )
 
 
-def _on_raw_batch(robot_id: str, batch: list) -> None:
+def _on_raw_batch(robot_id: str, batch: list,
+                  skew: Optional[float] = None) -> None:
     """Relayed topics feed both the archive and the alert engine."""
     if writer:
-        writer.record_topics(robot_id, batch)
+        writer.record_topics(robot_id, batch, skew)
     if alerts:
         alerts.observe_topics(robot_id, batch)
 
@@ -444,28 +445,43 @@ app = FastAPI(title="Fleet Server", version="1.0", lifespan=lifespan,
 OPEN_PATHS = {"/healthz", "/login", "/logout", "/favicon.ico", "/api/enroll"}
 OPEN_PREFIXES = ("/agent/",)     # wheel download; contains no secrets
 
-# Paths that must never be answerable through Funnel.
+# What the PUBLIC listener is allowed to answer. Everything else 404s there.
 #
-# The dashboard is the only thing that has any business being on the public
-# internet. Administration, enrollment and the agent wheel are all operator
-# surfaces, reached from inside the tailnet -- and every vehicle is already on
-# the tailnet before it enrolls, so nothing legitimate is lost.
+# An allowlist, not a blocklist, and that choice is the whole point. With a
+# blocklist, the failure mode of forgetting to classify a new endpoint is that
+# it is silently exposed to the internet. With an allowlist, the failure mode
+# is that it 404s on the public port and someone notices immediately. Both are
+# mistakes; only one of them is a breach.
 #
-# The password already guards these. That is not the same protection: a
-# password holds until the first authentication bug, a missing route holds
-# regardless. Enrollment in particular is unauthenticated by construction --
-# the one-time token IS the credential -- so leaving it exposed to the whole
-# internet means anyone can grind tokens.
-PRIVATE_PREFIXES = ("/admin", "/api/admin", "/api/enroll", "/agent/",
-                    "/api/system", "/api/db", "/api/events", "/api/alerts",
-                    "/api/topics", "/api/rules", "/api/push")
+# This list is exactly what the dashboard fetches -- verified against every
+# fetch() and WebSocket in web/*.js, not guessed:
+#   app.js    /ws, /api/alerts/active
+#   push.js   /api/push/{key,subscribe,unsubscribe}
+#   shell.js  (no network)
+PUBLIC_PATHS = {
+    "/", "/healthz", "/login", "/logout", "/favicon.ico",
+    "/manifest.json", "/sw.js", "/surface.js",
+    "/ws",
+    # Dashboard data. Live state only -- history and topic browsing are
+    # operator surfaces and live on the private listener.
+    "/api/fleet", "/api/summary",
+    # Active alerts are shown on the dashboard. Rule editing, history and the
+    # test endpoint are not.
+    "/api/alerts/active",
+    # Enabling notifications from the phone is the point of the PWA, so these
+    # three have to work from the public page. /api/push/devices is the admin
+    # listing and is deliberately absent.
+    "/api/push/key", "/api/push/subscribe", "/api/push/unsubscribe",
+}
+PUBLIC_PREFIXES = ("/static/", "/api/robot/")
 
 PRIVATE_PORT = int(CFG["http"].get("private_port") or 0)
 PRIVATE_HOST = CFG["http"].get("private_host") or "127.0.0.1"
 
 
 def is_private_path(path: str) -> bool:
-    return path == "/admin" or path.startswith(PRIVATE_PREFIXES)
+    """True when this path must not be served to the public internet."""
+    return not (path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES))
 
 
 def arrived_privately(request: Request) -> bool:
@@ -578,6 +594,28 @@ def ws_authed(ws: WebSocket) -> bool:
 
 # ---------------------------------------------------------------------- routes
 
+@app.get("/surface.js")
+async def surface_js(request: Request):
+    """Tells the page which listener served it, before any nav is drawn.
+
+    The dashboard's nav links to /admin/*, which 404 on the public port now.
+    Rendering buttons that are guaranteed to fail is worse than not having
+    them: the user cannot tell a permissions boundary from a broken site.
+
+    This is a generated script rather than a fetch() because the shell builds
+    its nav synchronously on load -- an async answer would arrive after the
+    dead links were already on screen.
+
+    It exposes one boolean and no address. The public page must not learn the
+    tailnet URL of the admin surface; someone who belongs there already knows
+    it, and someone who does not should not be handed it.
+    """
+    admin = arrived_privately(request)
+    body = f"window.ITRI_SURFACE={{admin:{str(admin).lower()}}};"
+    return Response(body, media_type="application/javascript",
+                    headers={"cache-control": "no-store"})
+
+
 @app.get("/healthz", response_class=PlainTextResponse)
 async def healthz():
     return "ok"
@@ -679,6 +717,10 @@ async def api_metrics():
         # Batches from agents predating the envelope -- these cannot be
         # deduplicated, so a non-zero value here is a fleet-upgrade to-do.
         "unversioned_batches": router.unversioned,
+        # (vehicle clock - server clock) per robot, seconds. Non-zero here
+        # means that vehicle's NTP is not working; its timestamps are being
+        # corrected on the way in, but the fix belongs on the vehicle.
+        "clock_skew_s": {k: round(v, 2) for k, v in router.last_skew.items()},
         "broker_stats": broker.stats if broker else None,
     }
     snap["history"] = writer.stats() if writer else {"enabled": False}
