@@ -91,7 +91,22 @@ ip_logged = any(e["detail"] and e["detail"].get("ip") for e in
 check("登記來源 IP 有記錄", ip_logged)
 
 print("\n=== 8. 管理頁面可載入 ===")
-for path in ("/admin", "/static/admin.js", "/static/admin.css"):
+# Every admin page and the scripts they load. Listing them individually is the
+# point: the admin used to be one page, and when it was split the old test kept
+# passing against a file that no longer existed.
+r = c.get(f"{B}/admin", headers=ADMIN)
+check("/admin 轉向 /admin/robots",
+      r.status_code in (301, 302, 307, 308)
+      and r.headers.get("location", "").endswith("/admin/robots"),
+      f"-> {r.status_code} {r.headers.get('location', '')}")
+
+for path in ("/admin/robots", "/admin/topics", "/admin/alerts",
+             "/admin/events", "/admin/system",
+             "/static/admin_common.js", "/static/admin_robots.js",
+             "/static/admin_topics.js", "/static/admin_alerts.js",
+             "/static/admin_events.js", "/static/admin_system.js",
+             "/static/shell.js", "/static/push.js",
+             "/static/admin.css", "/static/style.css"):
     r = c.get(f"{B}{path}", headers=ADMIN)
     check(path, r.status_code == 200, f"-> {r.status_code}, {len(r.content)} bytes")
 
