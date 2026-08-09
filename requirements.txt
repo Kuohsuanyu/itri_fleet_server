@@ -1,0 +1,8 @@
+PyYAML>=6.0
+fastapi>=0.110
+httpx>=0.27
+paho-mqtt>=2.0
+psycopg[binary,pool]>=3.2
+pywebpush>=2.0
+uvicorn>=0.27
+websockets>=12

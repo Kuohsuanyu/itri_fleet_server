@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ITRI Fleet — Topic 瀏覽器</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/admin.css">
+<link rel="manifest" href="/manifest.json" crossorigin="use-credentials">
+<meta name="theme-color" content="#0a0e13">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#128666;</text></svg>">
+</head>
+<body>
+<section class="panel">
+  <div class="panel-head">
+    <h2>Topic 瀏覽器</h2>
+    <div class="panel-tools">
+      <select class="search" id="t-robot" style="width:auto"></select>
+      <input class="search" id="t-filter" type="search" placeholder="篩選 topic">
+      <label class="chk"><input type="checkbox" id="t-live" checked> 即時更新</label>
+      <span class="hint" id="t-count">–</span>
+    </div>
+  </div>
+  <div class="tablewrap scroll">
+    <table class="tbl">
+      <thead><tr><th>Topic</th><th>最新值</th><th>樣本數</th>
+        <th>最後更新</th><th class="right">操作</th></tr></thead>
+      <tbody id="topics-body"></tbody>
+    </table>
+    <div class="empty" id="topics-empty">這台車還沒有轉發任何 topic。</div>
+  </div>
+  <div class="hint" style="padding:10px 14px">
+    agent 原樣轉發上位機的 topic,伺服器不解析。這裡列出的是它實際收到過什麼。
+    按<b>圖表</b>看歷史趨勢,按<b>設預警</b>直接對這個 topic 建門檻規則。
+  </div>
+</section>
+
+<section class="panel" id="chartpanel" hidden>
+  <div class="panel-head">
+    <h2 id="chart-title">—</h2>
+    <div class="panel-tools">
+      <div class="segbar" id="chart-range">
+        <button class="seg active" data-h="1">1 小時</button>
+        <button class="seg" data-h="6">6 小時</button>
+        <button class="seg" data-h="24">24 小時</button>
+        <button class="seg" data-h="168">7 天</button>
+      </div>
+      <button class="btn" id="chart-close">關閉</button>
+    </div>
+  </div>
+  <div style="padding:14px"><canvas id="chart"></canvas></div>
+  <div class="hint" id="chart-note" style="padding:0 14px 14px">—</div>
+</section>
+<script src="/static/push.js"></script>
+<script src="/static/shell.js"></script>
+<script src="/static/admin_common.js"></script>
+<script src="/static/admin_topics.js"></script>
+</body>
+</html>

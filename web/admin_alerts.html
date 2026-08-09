@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ITRI Fleet — 預警規則</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/admin.css">
+<link rel="manifest" href="/manifest.json" crossorigin="use-credentials">
+<meta name="theme-color" content="#0a0e13">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#128666;</text></svg>">
+</head>
+<body>
+<section class="panel">
+  <div class="panel-head">
+    <h2>預警規則</h2>
+    <div class="panel-tools">
+      <span class="hint" id="chan-list">–</span>
+      <select class="search" id="test-chan" style="width:auto"></select>
+      <button class="btn" id="btn-test">送測試通知</button>
+      <button class="btn primary" id="btn-newrule">+ 新增規則</button>
+    </div>
+  </div>
+
+  <form class="newbox" id="rulebox" hidden>
+    <div class="field"><label>名稱</label><input id="r-name" placeholder="例:電量過低" required></div>
+    <div class="field narrow"><label>套用車輛</label>
+      <select id="r-robot"><option value="">全部</option></select></div>
+    <div class="field narrow"><label>資料來源</label>
+      <select id="r-source">
+        <option value="field">標準欄位</option>
+        <option value="topic">轉發的 topic</option>
+        <option value="presence">上下線</option>
+      </select></div>
+    <div class="field"><label>監看項目 <span class="opt" id="r-live"></span></label>
+      <input id="r-key" list="key-options" placeholder="battery">
+      <datalist id="key-options"></datalist></div>
+    <div class="field narrow"><label>條件</label>
+      <select id="r-op">
+        <option value="lt">小於</option><option value="gt">大於</option>
+        <option value="outside">超出範圍</option><option value="inside">落在範圍</option>
+        <option value="eq">等於(文字)</option><option value="ne">不等於(文字)</option>
+        <option value="offline">離線超過(秒)</option>
+      </select></div>
+    <div class="field narrow"><label>數值 / 下限</label>
+      <input id="r-value" type="number" step="any"></div>
+    <div class="field narrow" id="wrap-v2" hidden><label>上限</label>
+      <input id="r-value2" type="number" step="any"></div>
+    <div class="field narrow" id="wrap-text" hidden><label>文字</label>
+      <input id="r-text" placeholder="error"></div>
+    <div class="field narrow"><label>持續幾秒才觸發</label>
+      <input id="r-for" type="number" step="any" value="10"></div>
+    <div class="field narrow"><label>恢復門檻<span class="opt">選填</span></label>
+      <input id="r-clear" type="number" step="any"></div>
+    <div class="field narrow"><label>等級</label>
+      <select id="r-sev"><option value="warn">warn</option><option value="critical">critical</option></select></div>
+    <div class="field narrow"><label>重複提醒(分)</label>
+      <input id="r-cool" type="number" step="any" value="15"></div>
+    <div class="field wide"><label>通知內容
+        <span class="opt">留空自動產生。可用 {robot} {id} {key} {value} {limit} {limit2} {rule}</span></label>
+      <input id="r-msg" placeholder="{robot} 電量只剩 {value}%,低於 {limit}%,請回充電站"></div>
+    <div class="field wide"><div class="hint" id="r-preview">預覽:—</div></div>
+    <div class="field-actions">
+      <button class="btn primary" type="submit">儲存</button>
+      <button class="btn" type="button" id="btn-rulecancel">取消</button>
+    </div>
+  </form>
+
+  <div class="tablewrap">
+    <table class="tbl">
+      <thead><tr><th>啟用</th><th>名稱</th><th>車輛</th><th>條件</th><th>通知內容</th>
+        <th>持續</th><th>恢復</th><th>等級</th><th class="right">操作</th></tr></thead>
+      <tbody id="rules-body"></tbody>
+    </table>
+    <div class="empty" id="rules-empty">還沒有規則。按「+ 新增規則」建立第一條。</div>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2>目前觸發中</h2></div>
+  <div class="tablewrap">
+    <table class="tbl">
+      <thead><tr><th>狀態</th><th>車輛</th><th>訊息</th><th>持續</th></tr></thead>
+      <tbody id="active-body"></tbody>
+    </table>
+    <div class="empty" id="active-empty">目前沒有觸發中的告警。</div>
+  </div>
+  <div class="egress-grid">
+    <div class="eg"><div class="eg-v" id="a-fired">–</div><div class="eg-k">累計觸發</div></div>
+    <div class="eg"><div class="eg-v" id="a-resolved">–</div><div class="eg-k">已恢復</div></div>
+    <div class="eg"><div class="eg-v" id="a-devices">–</div><div class="eg-k">推播裝置</div></div>
+    <div class="eg"><div class="eg-v" id="a-failed">–</div><div class="eg-k">通知失敗</div></div>
+  </div>
+  <div class="hint" id="a-note" style="padding:0 14px 14px">—</div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2>告警歷史</h2></div>
+  <div class="tablewrap scroll">
+    <table class="tbl">
+      <thead><tr><th>開始</th><th>結束</th><th>車輛</th><th>等級</th><th>訊息</th><th>已通知</th></tr></thead>
+      <tbody id="hist-body"></tbody>
+    </table>
+    <div class="empty" id="hist-empty">還沒有任何告警紀錄。</div>
+  </div>
+</section>
+<script src="/static/push.js"></script>
+<script src="/static/shell.js"></script>
+<script src="/static/admin_common.js"></script>
+<script src="/static/admin_alerts.js"></script>
+</body>
+</html>

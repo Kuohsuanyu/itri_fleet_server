@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ITRI Fleet — 系統</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/admin.css">
+<link rel="manifest" href="/manifest.json" crossorigin="use-credentials">
+<meta name="theme-color" content="#0a0e13">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#128666;</text></svg>">
+</head>
+<body>
+<section class="panel">
+  <div class="panel-head"><h2>資料庫用量</h2><span class="hint">實測值,非估算</span></div>
+  <div class="egress-grid">
+    <div class="eg"><div class="eg-v" id="st-rows">–</div><div class="eg-k">遙測列數</div></div>
+    <div class="eg"><div class="eg-v" id="st-size">–</div><div class="eg-k">佔用(含索引)</div></div>
+    <div class="eg"><div class="eg-v" id="st-per">–</div><div class="eg-k">每列</div></div>
+    <div class="eg"><div class="eg-v" id="st-rate">–</div><div class="eg-k">寫入速率</div></div>
+    <div class="eg"><div class="eg-v" id="st-day">–</div><div class="eg-k">推估 / 天</div></div>
+    <div class="eg"><div class="eg-v" id="st-ret">–</div><div class="eg-k">保留期總量</div></div>
+  </div>
+  <div class="hint" id="st-note" style="padding:0 14px 14px">—</div>
+  <div class="tablewrap scroll">
+    <table class="tbl"><thead><tr><th>分區</th><th>約略列數</th><th>大小</th></tr></thead>
+      <tbody id="parts-body"></tbody></table>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>推播裝置</h2>
+    <div class="panel-tools">
+      <button class="btn primary" id="btn-push">&#128276; 在這台裝置開啟通知</button>
+    </div>
+  </div>
+  <div class="tablewrap">
+    <table class="tbl">
+      <thead><tr><th>裝置</th><th>瀏覽器</th><th>訂閱時間</th><th>最後送達</th></tr></thead>
+      <tbody id="dev-body"></tbody>
+    </table>
+    <div class="empty" id="dev-empty">還沒有裝置訂閱推播。</div>
+  </div>
+  <div class="hint" style="padding:10px 14px">
+    iOS 需要先用 Safari 開啟 &#8594; 分享 &#8594; <b>加入主畫面</b> &#8594; 從主畫面開啟,才會出現通知權限。
+    Android Chrome 直接按上面的按鈕即可。
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2>外網流量 / MQTT</h2></div>
+  <div class="egress-grid">
+    <div class="eg"><div class="eg-v" id="e-rate">–</div><div class="eg-k">egress 速率</div></div>
+    <div class="eg"><div class="eg-v" id="e-total">–</div><div class="eg-k">啟動後累計</div></div>
+    <div class="eg"><div class="eg-v" id="e-month">–</div><div class="eg-k">推估 / 月</div></div>
+    <div class="eg"><div class="eg-v" id="e-clients">–</div><div class="eg-k">連線儀表板</div></div>
+    <div class="eg"><div class="eg-v" id="m-mode">–</div><div class="eg-k">MQTT 認證</div></div>
+    <div class="eg"><div class="eg-v" id="m-conn">–</div><div class="eg-k">broker 連線</div></div>
+    <div class="eg"><div class="eg-v" id="m-auth">–</div><div class="eg-k">認證失敗</div></div>
+    <div class="eg"><div class="eg-v" id="m-acl">–</div><div class="eg-k">ACL 拒絕</div></div>
+    <div class="eg"><div class="eg-v" id="m-buf">–</div><div class="eg-k">寫入緩衝</div></div>
+    <div class="eg"><div class="eg-v" id="m-drop">–</div><div class="eg-k">丟失</div></div>
+  </div>
+</section>
+<script src="/static/push.js"></script>
+<script src="/static/shell.js"></script>
+<script src="/static/admin_common.js"></script>
+<script src="/static/admin_system.js"></script>
+</body>
+</html>

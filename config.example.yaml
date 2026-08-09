@@ -1,0 +1,138 @@
+# ---------------------------------------------------------------------------
+# 設定範本。第一次安裝執行:
+#
+#     python tools/setup.py
+#
+# 它會由這個檔產生 config.yaml、產生 VAPID 金鑰、建立資料庫、設定儀表板密碼。
+# config.yaml 在 .gitignore 裡,永遠不會進版本控制 —— 所有機密都只在那裡。
+#
+# 之後要調整任何設定,改 config.yaml 再重啟伺服器即可,不用動程式碼。
+# ---------------------------------------------------------------------------
+
+# Fleet server configuration.
+# Every value can also be set by env var: FLEET_PORT, FLEET_TOKEN, FLEET_MQTT_HOST.
+
+http:
+  host: 0.0.0.0
+  port: 8080
+  # Tailscale Funnel puts this page on the public internet with no auth of its
+  # own, so everything here is the only thing standing in front of it.
+  # null = wide open (localhost testing only).
+  password: CHANGE_ME
+  session_days: 30        # how long a successful login is remembered
+  max_attempts: 10        # failed logins allowed per window, then 429
+  attempt_window_min: 5
+
+mqtt:
+  # true  -> run the built-in asyncio broker on `port` (no Mosquitto needed)
+  # false -> connect to an external broker at host:port
+  embedded: true
+  host: 127.0.0.1
+  port: 1883
+  # Which interface the broker listens on. This is a security control, not a
+  # convenience setting:
+  #   0.0.0.0        every interface -- anyone on the office LAN can reach 1883
+  #                  and Tailscale protects nothing, because they never touch it
+  #   tailscale      the Tailscale address only (auto-detected) -- traffic must arrive through
+  #                  WireGuard, so network access and MQTT credentials become
+  #                  two independent requirements
+  bind: tailscale
+  # Address robots should connect to, handed out during enrollment.
+  # Leave null to echo back whatever host the agent used to reach the API.
+  # The MagicDNS name, not a raw IP: if the server moves to another
+  # machine that keeps the node name, already-enrolled robots keep
+  # working. A baked-in 100.x address would strand every one of them.
+  public_host: tailscale   # 或直接填你的 MagicDNS 名稱
+  # true  -> every robot must connect with the credentials it received during
+  #          enrollment, and may only touch fleet/<its own id>/*
+  # false -> anonymous publish allowed (development only; the archive is then
+  #          forgeable by anyone who can reach port 1883)
+  require_auth: true
+  username: null         # legacy single shared account; leave null
+  password: null
+  topic: fleet/+/status
+  lwt_topic: fleet/+/lwt
+  raw_topic: fleet/+/raw     # itri-agent relays the vehicle's own topics here
+  command_topic: fleet/{id}/cmd
+
+dashboard:
+  push_hz: 1.0           # WebSocket frames per second (the main egress knob)
+  offline_after: 6.0     # seconds without telemetry before a robot goes grey
+  history_points: 240    # per-robot trail kept in memory (sparklines)
+  ws_ping_s: 20          # WebSocket keepalive
+
+registry:
+  token_ttl_min: 30      # how long an enrollment token stays valid
+  credential_cache_s: 30 # how long the broker trusts its cached credentials
+
+database:
+  enabled: true
+  # Override with the FLEET_DB_DSN env var in production so the password does
+  # not live in a file that gets copied around.
+  dsn: postgresql://itri:CHANGE_ME@127.0.0.1:5432/itri_fleet
+  retention_days: 31       # expired daily partitions are DROPped, not DELETEd
+  flush_interval_s: 1.0    # batch window; every sample is stored (no downsampling)
+  buffer_max: 200000         # telemetry rows held if the DB goes away
+  topic_buffer_max: 400000   # relayed topic rows held if the DB goes away
+  event_buffer_max: 20000
+  partition_days_ahead: 2    # create daily partitions this far in advance
+
+alerts:
+  enabled: true
+  # Rules (thresholds, ranges) are edited in the dashboard, not here.
+  # Only channel credentials live in this file.
+  channels:
+    # Web Push straight to the dashboard PWA. Add the site to your phone's home
+    # screen and it behaves like an app -- notifications with the screen off,
+    # no app store, no Apple Developer fee (iOS 16.4+ supports this).
+    # Regenerate keys with: python tools/gen_vapid.py
+    push:
+      enabled: true
+      public_key: GENERATED_BY_SETUP
+      private_key: GENERATED_BY_SETUP
+      contact: mailto:you@example.com
+      ttl: 3600
+
+    # ntfy: the fastest route to phone push notifications. Install the ntfy app
+    # (iOS/Android, free, open source), subscribe to the topic below, done.
+    # No account, no app to write, no Apple Developer fee.
+    # Pick a long random topic name -- on the public server it IS the password.
+    ntfy:
+      enabled: false
+      url: https://ntfy.sh
+      topic: itri-fleet-CHANGE-ME-a7f3k9
+      token: null            # only for a self-hosted/protected ntfy
+
+    telegram:
+      enabled: false
+      bot_token: null        # from @BotFather
+      chat_id: null          # your user or group id
+
+    webhook:                 # into whatever you already run
+      enabled: false
+      url: null
+      headers: {}
+
+    # LINE Notify shut down 2025-03-31. This is the Messaging API replacement:
+    # only 200 free pushes per month, so reserve it for critical alerts.
+    line:
+      enabled: false
+      access_token: null
+      to: null               # user or group id
+
+    email:
+      enabled: false
+      host: smtp.gmail.com
+      port: 587
+      starttls: true
+      username: null
+      password: null
+      from: null
+      to: []
+
+bwtest:
+  # Off. This endpoint returns arbitrarily large random blobs; leaving it
+  # reachable from the public internet is a free bandwidth amplifier.
+  # Flip to true only while running tools/bw_probe.py, then flip it back.
+  enabled: false
+  max_mb: 64

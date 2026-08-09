@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ITRI Fleet — 車輛註冊</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/admin.css">
+<link rel="manifest" href="/manifest.json" crossorigin="use-credentials">
+<meta name="theme-color" content="#0a0e13">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#128666;</text></svg>">
+</head>
+<body>
+<section class="panel">
+  <div class="panel-head">
+    <h2>車輛註冊</h2>
+    <div class="panel-tools">
+      <span class="hint" id="robot-count">–</span>
+      <button class="btn primary" id="btn-new">+ 新增車輛</button>
+    </div>
+  </div>
+
+  <form class="newbox" id="newbox" hidden>
+    <div class="field"><label for="f-name">名稱</label>
+      <input id="f-name" placeholder="例:AMR-07" required></div>
+    <div class="field"><label for="f-id">機器 ID<span class="opt">留空自動產生</span></label>
+      <input id="f-id" placeholder="amr-07"></div>
+    <div class="field narrow"><label for="f-ttl">token 有效(分)</label>
+      <input id="f-ttl" type="number" value="30" min="1" max="1440"></div>
+    <div class="field-actions">
+      <button class="btn primary" type="submit">建立並產生 token</button>
+      <button class="btn" type="button" id="btn-cancel">取消</button>
+    </div>
+  </form>
+
+  <div class="tokenbox" id="tokenbox" hidden>
+    <div class="tb-head">
+      <span class="tb-title">&#10003; <b id="tb-name"></b> 已建立</span>
+      <button class="btn" id="tb-close">關閉</button>
+    </div>
+    <p class="tb-note">在那台上位機依序執行。<b>token 只能用一次</b>,過期時間 <span id="tb-exp"></span>。</p>
+    <div class="cmd"><code id="tb-cmd"></code><button class="btn" id="tb-copy">複製</button></div>
+    <p class="tb-note dim">機器人用 token 換到自己專屬的 MQTT 帳密,伺服器只保存雜湊值。</p>
+  </div>
+
+  <div class="tablewrap">
+    <table class="tbl">
+      <thead><tr><th>ID</th><th>名稱</th><th>憑證</th><th>即時</th>
+        <th>電量</th><th>最後回報</th><th>標籤</th><th class="right">操作</th></tr></thead>
+      <tbody id="robots-body"></tbody>
+    </table>
+    <div class="empty" id="robots-empty">還沒有註冊任何車輛。</div>
+  </div>
+</section>
+<script src="/static/push.js"></script>
+<script src="/static/shell.js"></script>
+<script src="/static/admin_common.js"></script>
+<script src="/static/admin_robots.js"></script>
+</body>
+</html>

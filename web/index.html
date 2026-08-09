@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ITRI Fleet Console</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/admin.css">
+<link rel="manifest" href="/manifest.json" crossorigin="use-credentials">
+<meta name="theme-color" content="#0a0e13">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ITRI Fleet">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🚚</text></svg>">
+</head>
+<body>
+
+<div class="alertbar" id="alertbar" hidden></div>
+
+<section class="stats" id="stats">
+  <div class="stat"><div class="stat-v" id="s-online">–</div><div class="stat-k">在線 / 總數</div></div>
+  <div class="stat"><div class="stat-v" id="s-moving">–</div><div class="stat-k">移動中</div></div>
+  <div class="stat"><div class="stat-v" id="s-charging">–</div><div class="stat-k">充電中</div></div>
+  <div class="stat"><div class="stat-v" id="s-fault">–</div><div class="stat-k">異常</div></div>
+  <div class="stat"><div class="stat-v" id="s-batt">–</div><div class="stat-k">平均電量</div></div>
+  <div class="stat"><div class="stat-v" id="s-minbatt">–</div><div class="stat-k">最低電量</div></div>
+  <div class="stat"><div class="stat-v" id="s-msgs">–</div><div class="stat-k">MQTT 訊息</div></div>
+</section>
+
+<main class="panel fleet-panel">
+  <div class="panel-head">
+    <h2>車隊狀態</h2>
+    <div class="panel-tools">
+      <div class="segbar" id="filters">
+        <button class="seg active" data-f="all">全部</button>
+        <button class="seg" data-f="online">在線</button>
+        <button class="seg" data-f="fault">異常</button>
+        <button class="seg" data-f="low">低電量</button>
+        <button class="seg" data-f="offline">離線</button>
+      </div>
+      <input class="search" id="search" type="search" placeholder="篩選 ID / 名稱">
+    </div>
+  </div>
+  <div class="cards" id="cards"></div>
+  <div class="empty" id="empty">尚未收到任何 MQTT 遙測。<br><code>fleet/&lt;id&gt;/status</code></div>
+</main>
+
+<section class="panel egress">
+  <div class="panel-head">
+    <h2>外網流量 (Tailscale Funnel egress)</h2>
+    <span class="hint">Funnel 沒有官方用量表,這裡直接量測本機送出的位元組</span>
+  </div>
+  <div class="egress-grid">
+    <div class="eg"><div class="eg-v" id="e-rate">–</div><div class="eg-k">目前速率</div></div>
+    <div class="eg"><div class="eg-v" id="e-total">–</div><div class="eg-k">本次啟動累計</div></div>
+    <div class="eg"><div class="eg-v" id="e-day">–</div><div class="eg-k">推估 / 天</div></div>
+    <div class="eg"><div class="eg-v" id="e-month">–</div><div class="eg-k">推估 / 月</div></div>
+    <div class="eg"><div class="eg-v" id="e-clients">–</div><div class="eg-k">連線中儀表板</div></div>
+    <div class="eg"><div class="eg-v" id="e-peak">–</div><div class="eg-k">峰值速率</div></div>
+  </div>
+  <div class="bar-wrap"><div class="bar" id="e-bar"></div></div>
+  <div class="hint" id="e-note">—</div>
+</section>
+
+<script src="/static/push.js"></script>
+<script src="/static/shell.js"></script>
+<script>ITRIShell.render({ title: 'Fleet Console', live: true });</script>
+<script src="/static/app.js"></script>
+</body>
+</html>

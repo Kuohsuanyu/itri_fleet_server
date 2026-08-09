@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "itri-fleet-agent"
+version = "0.1.0"
+description = "Relay a vehicle's own MQTT topics to the ITRI fleet server"
+readme = "README.md"
+# Raspberry Pi OS Bullseye still ships Python 3.9; do not require newer.
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+
+# One dependency on purpose. Enrollment uses urllib from the standard library,
+# so there is nothing to compile on an ARM board -- paho-mqtt is pure Python.
+dependencies = ["paho-mqtt>=2.0"]
+
+[project.scripts]
+itri-agent = "itri_agent.cli:main"
+
+[tool.setuptools]
+packages = ["itri_agent"]

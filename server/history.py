@@ -1,0 +1,333 @@
+"""Telemetry archival: memory buffer -> batched COPY into PostgreSQL.
+
+The contract with the rest of the server is that this layer is allowed to fail.
+`FleetState` and the dashboard never read from here, so a database outage costs
+you history, not monitoring. While the DB is down samples pile up in a bounded
+ring buffer and are flushed once it returns; if the outage outlasts the buffer
+the oldest samples are dropped and counted, never silently lost.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import time
+from collections import deque
+from datetime import datetime, timezone
+from typing import Any, Deque, Dict, List, Optional, Tuple
+
+from psycopg.types.json import Jsonb
+
+from .db import Database
+from .state import Robot
+
+log = logging.getLogger("history")
+
+
+def _ts(epoch: float) -> datetime:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc)
+
+
+# Vendors publish booleans as True/true/1/on/ON with no consistency, and a flag
+# you cannot chart is a flag you cannot investigate. Coerce here rather than
+# asking the agent to guess -- the agent stays dumb, and old agents benefit too.
+_TRUE = {"true", "1", "on", "yes", "t"}
+_FALSE = {"false", "0", "off", "no", "f"}
+
+
+def _numeric(value: Any) -> Optional[float]:
+    """Best-effort scalar for the indexed `num` column. None if not scalar."""
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(value) else None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s or len(s) > 32:
+            return None
+        low = s.lower()
+        if low in _TRUE:
+            return 1.0
+        if low in _FALSE:
+            return 0.0
+        try:
+            f = float(s)
+        except ValueError:
+            return None
+        return f if math.isfinite(f) else None
+    return None
+
+
+class TelemetryWriter:
+    def __init__(self, db: Database, flush_interval: float = 1.0,
+                 buffer_max: int = 200_000, event_buffer_max: int = 20_000,
+                 topic_buffer_max: int = 400_000):
+        self.db = db
+        self.flush_interval = max(float(flush_interval), 0.2)
+        self.buffer: Deque[tuple] = deque(maxlen=buffer_max)
+        self.events: Deque[tuple] = deque(maxlen=event_buffer_max)
+        self.topics: Deque[tuple] = deque(maxlen=topic_buffer_max)
+        self._catalog: Dict[tuple, list] = {}   # (robot,topic) -> [count, last]
+        self.topics_written = 0
+        self._last_state: Dict[str, str] = {}
+        self._last_errors: Dict[str, Tuple[str, ...]] = {}
+        self._seen_ids: set[str] = set()
+
+        self.written = 0
+        self.events_written = 0
+        self.dropped = 0
+        self.flush_failures = 0
+        self.last_flush_ms = 0.0
+        self.last_flush_at = 0.0
+        self._tasks: List[asyncio.Task] = []
+
+    # ------------------------------------------------------------- recording
+
+    def record(self, robot: Robot) -> None:
+        """Called for every accepted telemetry sample. Must be cheap and sync."""
+        if len(self.buffer) == self.buffer.maxlen:
+            self.dropped += 1          # deque discards the oldest for us
+        self.buffer.append((
+            robot.id, _ts(robot.last_seen), robot.battery, robot.state,
+            robot.v, robot.w, robot.x, robot.y, robot.yaw,
+            robot.temp, robot.wifi, robot.odom,
+            Jsonb(robot.extra) if robot.extra else None,
+        ))
+        self._seen_ids.add(robot.id)
+
+        # State transitions and new faults are the audit trail, not the firehose
+        prev = self._last_state.get(robot.id)
+        if prev != robot.state:
+            self._last_state[robot.id] = robot.state
+            if prev is not None:
+                self.note_event(robot.id, "state",
+                                {"from": prev, "to": robot.state},
+                                "warn" if robot.state in ("error", "estop") else "info")
+
+        errs = tuple(robot.errors)
+        if errs != self._last_errors.get(robot.id, ()):
+            self._last_errors[robot.id] = errs
+            if errs:
+                self.note_event(robot.id, "error", {"errors": list(errs)}, "critical")
+            elif prev is not None:
+                self.note_event(robot.id, "error", {"cleared": True}, "info")
+
+    def record_topics(self, robot_id: str, batch: list) -> None:
+        """A relayed batch of the vehicle's own topics: [[topic, ts, value], ...].
+
+        Values arrive as whatever the onboard broker published. A bare number is
+        stored in `num` so it can be charted from an indexed column; anything
+        else lands in `payload` as jsonb. Nothing is interpreted or discarded.
+        """
+        now = time.time()
+        for item in batch:
+            try:
+                topic, ts, value = item[0], item[1], item[2]
+            except (TypeError, IndexError):
+                self.dropped += 1
+                continue
+            if not isinstance(topic, str) or not topic:
+                self.dropped += 1
+                continue
+
+            num = _numeric(value)
+
+            if len(self.topics) == self.topics.maxlen:
+                self.dropped += 1
+            self.topics.append((robot_id, _ts(float(ts) if ts else now),
+                                topic[:500], num, Jsonb(value)))
+
+            seen = self._catalog.setdefault((robot_id, topic[:500]), [0, ""])
+            seen[0] += 1
+            seen[1] = str(value)[:200]
+
+    def note_event(self, robot_id: Optional[str], kind: str,
+                   detail: Optional[Dict[str, Any]] = None,
+                   severity: str = "info") -> None:
+        self.events.append((robot_id, datetime.now(timezone.utc), kind, severity,
+                            Jsonb(detail) if detail else None))
+
+    def note_presence(self, robot_id: str, online: bool) -> None:
+        self.note_event(robot_id, "online" if online else "offline",
+                        None, "info" if online else "warn")
+
+    # --------------------------------------------------------------- flushing
+
+    async def _flush_once(self) -> None:
+        if not self.buffer and not self.events and not self.topics:
+            return
+        if not self.db.ready:
+            if not await self.db.reconnect():
+                return                      # keep buffering, try again next tick
+
+        t0 = time.perf_counter()
+        batch = list(self.buffer)
+        self.buffer.clear()
+        ev_batch = list(self.events)
+        self.events.clear()
+        topic_batch = list(self.topics)
+        self.topics.clear()
+        catalog = [(rid, topic, n, last)
+                   for (rid, topic), (n, last) in self._catalog.items()]
+        self._catalog.clear()
+
+        try:
+            if batch:
+                await self.db.copy_telemetry(batch)
+                self.written += len(batch)
+            if topic_batch:
+                await self.db.copy_topic_samples(topic_batch)
+                self.topics_written += len(topic_batch)
+            if catalog:
+                await self.db.upsert_catalog(catalog)
+            if ev_batch:
+                await self.db.insert_events(ev_batch)
+                self.events_written += len(ev_batch)
+            if self._seen_ids:
+                await self.db.touch_last_seen(list(self._seen_ids))
+                self._seen_ids.clear()
+        except Exception as exc:
+            self.flush_failures += 1
+            self.db.ready = False
+            self.db.last_error = f"{type(exc).__name__}: {exc}"
+            # put the batches back at the front so ordering survives the retry
+            self.buffer.extendleft(reversed(batch))
+            self.events.extendleft(reversed(ev_batch))
+            self.topics.extendleft(reversed(topic_batch))
+            for rid, topic, n, last in catalog:
+                self._catalog[(rid, topic)] = [n, last]
+            log.warning("flush failed (%d telemetry + %d topic rows re-queued): %s",
+                        len(batch), len(topic_batch), exc)
+            return
+
+        self.last_flush_ms = (time.perf_counter() - t0) * 1000
+        self.last_flush_at = time.time()
+
+    async def _flush_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self.flush_interval)
+                await self._flush_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("flush loop error")
+
+    async def _maintenance_loop(self) -> None:
+        """Roll partitions forward and drop expired ones. Hourly is plenty."""
+        while True:
+            try:
+                if self.db.ready:
+                    await self.db.ensure_partitions()
+                    await self.db.drop_expired_partitions()
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("partition maintenance error")
+                await asyncio.sleep(300)
+
+    def start(self) -> None:
+        self._tasks = [asyncio.create_task(self._flush_loop()),
+                       asyncio.create_task(self._maintenance_loop())]
+
+    async def stop(self) -> None:
+        for t in self._tasks:
+            t.cancel()
+        for t in self._tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        await self._flush_once()   # best effort: do not throw away a final second
+
+    # ------------------------------------------------------------------ stats
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "db_ready": self.db.ready,
+            "db_error": self.db.last_error,
+            "buffered": len(self.buffer),
+            "buffer_max": self.buffer.maxlen,
+            "buffer_pct": round(len(self.buffer) / self.buffer.maxlen * 100, 1),
+            "topics_buffered": len(self.topics),
+            "topics_written": self.topics_written,
+            "rows_written": self.written,
+            "events_written": self.events_written,
+            "rows_dropped": self.dropped,
+            "flush_failures": self.flush_failures,
+            "last_flush_ms": round(self.last_flush_ms, 1),
+            "last_flush_age_s": round(time.time() - self.last_flush_at, 1)
+                                 if self.last_flush_at else None,
+        }
+
+
+# ------------------------------------------------------------------ queries
+
+async def query_telemetry(db: Database, robot_id: Optional[str],
+                          start: datetime, end: datetime,
+                          limit: int = 5000,
+                          bucket_s: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Raw samples, or time-bucketed averages when the window is wide.
+
+    Bucketing happens in SQL so a month-long query returns a few thousand rows
+    instead of ten million.
+    """
+    params: List[Any] = []
+    where = ["ts >= %s", "ts < %s"]
+    params += [start, end]
+    if robot_id:
+        where.append("robot_id = %s")
+        params.append(robot_id)
+    clause = " AND ".join(where)
+
+    if bucket_s:
+        params.append(limit)
+        return await db.fetch(f"""
+            SELECT robot_id,
+                   to_timestamp(floor(extract(epoch FROM ts) / {float(bucket_s)})
+                                * {float(bucket_s)}) AS ts,
+                   avg(battery)::real AS battery,
+                   avg(v)::real       AS v,
+                   max(abs(w))::real  AS w_peak,
+                   avg(temp)::real    AS temp,
+                   count(*)           AS samples
+            FROM telemetry
+            WHERE {clause}
+            GROUP BY robot_id, 2
+            ORDER BY 2
+            LIMIT %s
+        """, params)
+
+    params.append(limit)
+    return await db.fetch(f"""
+        SELECT robot_id, ts, battery, state, v, w, temp, wifi, odom, extra
+        FROM telemetry
+        WHERE {clause}
+        ORDER BY ts
+        LIMIT %s
+    """, params)
+
+
+async def query_events(db: Database, robot_id: Optional[str] = None,
+                       kind: Optional[str] = None, severity: Optional[str] = None,
+                       start: Optional[datetime] = None, end: Optional[datetime] = None,
+                       limit: int = 500) -> List[Dict[str, Any]]:
+    where, params = ["1=1"], []
+    if robot_id:
+        where.append("robot_id = %s"); params.append(robot_id)
+    if kind:
+        where.append("kind = %s"); params.append(kind)
+    if severity:
+        where.append("severity = %s"); params.append(severity)
+    if start:
+        where.append("ts >= %s"); params.append(start)
+    if end:
+        where.append("ts < %s"); params.append(end)
+    params.append(limit)
+    return await db.fetch(f"""
+        SELECT id, robot_id, ts, kind, severity, detail
+        FROM events WHERE {" AND ".join(where)}
+        ORDER BY ts DESC LIMIT %s
+    """, params)

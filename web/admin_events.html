@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ITRI Fleet — 事件記錄</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/admin.css">
+<link rel="manifest" href="/manifest.json" crossorigin="use-credentials">
+<meta name="theme-color" content="#0a0e13">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#128666;</text></svg>">
+</head>
+<body>
+<section class="panel">
+  <div class="panel-head">
+    <h2>事件記錄</h2>
+    <div class="panel-tools">
+      <div class="segbar" id="ev-filter">
+        <button class="seg active" data-s="">全部</button>
+        <button class="seg" data-s="critical">critical</button>
+        <button class="seg" data-s="warn">warn</button>
+        <button class="seg" data-s="info">info</button>
+      </div>
+      <input class="search" id="ev-robot" placeholder="限定 robot id">
+      <input class="search" id="ev-kind" placeholder="限定 kind">
+      <button class="btn" id="ev-refresh">重新整理</button>
+    </div>
+  </div>
+  <div class="tablewrap scroll">
+    <table class="tbl">
+      <thead><tr><th>時間</th><th>車輛</th><th>類型</th><th>等級</th><th>內容</th></tr></thead>
+      <tbody id="events-body"></tbody>
+    </table>
+    <div class="empty" id="events-empty">沒有事件。</div>
+  </div>
+  <div class="hint" style="padding:10px 14px">
+    事件是稽核軌跡:狀態轉換、錯誤、上下線、登記、撤銷、告警。<b>永久保留</b>,不隨遙測過期。
+  </div>
+</section>
+<script src="/static/push.js"></script>
+<script src="/static/shell.js"></script>
+<script src="/static/admin_common.js"></script>
+<script src="/static/admin_events.js"></script>
+</body>
+</html>

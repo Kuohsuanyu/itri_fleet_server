@@ -1,0 +1,104 @@
+/* Admin-only additions. The shared look lives in style.css. */
+
+.nav { display: flex; gap: 4px; margin-left: 18px; }
+.nav a {
+  color: var(--fg-dim); text-decoration: none; font-size: 12.5px;
+  padding: 4px 11px; border-radius: 6px;
+}
+.nav a:hover { color: var(--fg); background: #1b2837; }
+.nav a.on { background: var(--accent); color: #06212e; font-weight: 650; }
+
+.btn.primary {
+  background: var(--accent); color: #06212e; border-color: var(--accent);
+  font-weight: 650;
+}
+.btn.primary:hover { filter: brightness(1.1); color: #06212e; }
+.btn.danger { color: var(--bad); border-color: #46323a; }
+.btn.danger:hover { background: rgba(248,113,113,.12); border-color: var(--bad); }
+
+/* ------------------------------------------------------------ new robot */
+
+.newbox {
+  display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap;
+  padding: 14px; border-bottom: 1px solid var(--line); background: #0f1620;
+}
+.field { display: flex; flex-direction: column; gap: 5px; flex: 1; min-width: 170px; }
+.field.narrow { flex: 0 0 130px; min-width: 130px; }
+.field.wide { flex-basis: 100%; }
+.live { color: var(--ok); }
+canvas#chart { display: block; }
+.field label { font-size: 11px; color: var(--fg-dim); }
+.field .opt { color: #55636f; margin-left: 6px; }
+.field input {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 7px 10px; font-size: 13px;
+}
+.field input:focus { outline: none; border-color: var(--accent); }
+.field-actions { display: flex; gap: 8px; }
+
+/* --------------------------------------------------------------- token */
+
+.tokenbox {
+  margin: 14px; padding: 14px 16px; border-radius: 9px;
+  background: rgba(52,211,153,.07); border: 1px solid rgba(52,211,153,.35);
+}
+.tb-head { display: flex; justify-content: space-between; align-items: center; }
+.tb-title { color: var(--ok); font-size: 13.5px; }
+.tb-note { font-size: 12px; color: var(--fg-dim); margin: 9px 0 0; }
+.tb-note.dim { color: #5f7182; }
+.cmd {
+  display: flex; align-items: center; gap: 10px; margin-top: 10px;
+  background: #080d13; border: 1px solid var(--line); border-radius: 7px;
+  padding: 10px 12px;
+}
+.cmd { align-items: flex-start; }
+.cmd code {
+  flex: 1; font: 12.5px/1.7 var(--mono); color: var(--accent);
+  overflow-x: auto; white-space: pre;      /* multi-line install steps */
+}
+
+/* --------------------------------------------------------------- tables */
+
+.tablewrap { overflow-x: auto; }
+.tablewrap.scroll { max-height: 420px; overflow-y: auto; }
+.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.tbl th {
+  text-align: left; font-weight: 600; font-size: 11px; color: var(--fg-dim);
+  padding: 9px 12px; border-bottom: 1px solid var(--line);
+  background: var(--panel-2); position: sticky; top: 0; z-index: 1;
+}
+.tbl td { padding: 9px 12px; border-bottom: 1px solid #1a2431; vertical-align: middle; }
+.tbl tr:last-child td { border-bottom: 0; }
+.tbl tr:hover td { background: #16202c; }
+.tbl .right, .tbl th.right { text-align: right; }
+.tbl .mono { font-family: var(--mono); }
+.tbl .dim { color: var(--fg-dim); }
+
+.badge {
+  display: inline-block; font-size: 10px; letter-spacing: .5px;
+  padding: 2px 8px; border-radius: 999px; background: #24313f; color: var(--fg-dim);
+  white-space: nowrap;
+}
+.badge.ok      { background: rgba(52,211,153,.15); color: var(--ok); }
+.badge.pending { background: rgba(251,191,36,.15); color: var(--warn); }
+.badge.bad     { background: rgba(248,113,113,.15); color: var(--bad); }
+.badge.mute    { background: #232c36; color: #5b6b7c; }
+
+.row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+
+.detail {
+  font: 11.5px var(--mono); color: var(--fg-dim);
+  max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- toast */
+
+.toast {
+  position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%) translateY(80px);
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--fg);
+  padding: 10px 18px; border-radius: 8px; font-size: 13px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.5);
+  opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none; z-index: 50;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast.err { border-color: var(--bad); color: var(--bad); }
