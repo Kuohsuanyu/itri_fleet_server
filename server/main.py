@@ -930,12 +930,17 @@ def install_command(base_url: str, token: str) -> Dict[str, Any]:
         "curl -fsSL https://tailscale.com/install.sh | sh",
         f"sudo tailscale up --authkey={TAILSCALE_AUTHKEY_HINT} --advertise-tags=tag:robot",
     ]
-    steps.append(f"pip install {base_url}/agent/{wheel.name}" if wheel
-                 else "pip install itri-fleet-agent   # (伺服器上尚未建置 wheel)")
+    # Raspberry Pi OS Bookworm and Debian 12 enforce PEP 668: pip refuses to
+    # install into the system Python at all. pipx puts the CLI in its own
+    # environment and still exposes `itri-agent` on PATH, which is what we want.
+    url = f"{base_url}/agent/{wheel.name}" if wheel else "itri-fleet-agent"
+    steps.append("sudo apt install -y pipx && pipx ensurepath")
+    steps.append(f"pipx install {url}")
     steps.append(f"itri-agent enroll --server {base_url} --token {token}")
     steps.append("itri-agent discover")
     steps.append("itri-agent run")
-    return {"steps": steps, "oneliner": steps[-3]}
+    return {"steps": steps, "oneliner": steps[-3],
+            "note": "Bookworm 之後 pip 不能裝進系統 Python(PEP 668),所以用 pipx"}
 
 
 @app.get("/api/admin/robots")

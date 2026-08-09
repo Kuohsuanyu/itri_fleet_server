@@ -158,8 +158,9 @@ python tools\console.py --action funnel-off
 curl -fsSL https://tailscale.com/install.sh | sh
 sudo tailscale up --authkey=tskey-auth-XXXXX --advertise-tags=tag:robot
 
-# 2. 裝套件(純 Python,ARM 上不用編譯,只有一個相依)
-pip install https://<你的網址>/agent/latest.whl
+# 2. 裝套件。Bookworm 起 pip 不能裝進系統 Python(PEP 668),用 pipx
+sudo apt install -y pipx && pipx ensurepath
+pipx install https://<你的網址>/agent/latest.whl
 
 # 3. 設定精靈:問你伺服器網址和授權碼,然後掃描本地 topic 讓你勾選
 itri-agent
