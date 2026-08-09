@@ -15,6 +15,24 @@ from typing import Any, Deque, Dict, List, Optional
 # Default trail points per robot; overridden from config by FleetState.
 HISTORY_LEN = 240
 
+# Presence is four states, not a boolean.
+#
+# A boolean forces every ambiguous situation into "online", and the ambiguous
+# situations are the dangerous ones. The case that matters: the agent's MQTT
+# session is healthy, so no last-will fires and the broker reports the robot as
+# connected -- but the agent stopped relaying, or its data source died. With a
+# boolean that robot reads as perfectly fine, indefinitely. STALE is what makes
+# that visible.
+#
+#   UNKNOWN  registered, nothing ever received. Not a fault -- but not proof of
+#            health either, and it must not be counted as online.
+#   OK       telemetry arrived within `offline_after`.
+#   STALE    nothing recently, but no positive evidence it is gone. The
+#            interesting state: something is wrong and nobody was told.
+#   OFFLINE  positive evidence: the last will fired, or silence long enough
+#            that no other reading is credible.
+UNKNOWN, OK, STALE, OFFLINE = "unknown", "ok", "stale", "offline"
+
 
 def _num(value: Any, default: Optional[float] = None) -> Optional[float]:
     try:
@@ -28,7 +46,7 @@ class Robot:
     __slots__ = ("id", "name", "state", "battery", "x", "y", "yaw", "v", "w",
                  "mission", "progress", "errors", "temp", "wifi", "odom",
                  "extra", "last_seen", "online", "rx_count", "rx_bytes",
-                 "history", "rev")
+                 "history", "rev", "presence", "link", "link_at")
 
     def __init__(self, robot_id: str, history_len: int = HISTORY_LEN):
         self.id = robot_id
@@ -48,7 +66,12 @@ class Robot:
         self.odom: Optional[float] = None
         self.extra: Dict[str, Any] = {}
         self.last_seen = 0.0
-        self.online = False
+        self.presence = UNKNOWN
+        # What the last-will topic last said, and when. None = never heard from
+        # the broker at all, which is different from "it said offline".
+        self.link: Optional[bool] = None
+        self.link_at = 0.0
+        self.online = False      # derived: presence == OK. Kept for callers.
         self.rx_count = 0
         self.rx_bytes = 0
         self.history: Deque[Dict[str, float]] = deque(maxlen=history_len)
@@ -106,6 +129,7 @@ class Robot:
                 self.extra[k] = val
 
         self.last_seen = now
+        self.presence = OK
         self.online = True
         self.rx_count += 1
         self.rx_bytes += raw_size
@@ -118,12 +142,40 @@ class Robot:
             "v": round(self.v, 3),
         })
 
-    def mark_offline(self) -> bool:
-        if not self.online:
+    def set_presence(self, presence: str) -> bool:
+        """Returns True if it actually changed, so callers can log/push."""
+        if presence == self.presence:
             return False
-        self.online = False
+        self.presence = presence
+        self.online = presence == OK
         self.rev += 1
         return True
+
+    def mark_offline(self) -> bool:
+        return self.set_presence(OFFLINE)
+
+    def evaluate(self, now: float, offline_after: float,
+                 stale_after: float) -> bool:
+        """Decide presence from every signal available, not just the last will.
+
+        Order matters. An explicit last-will "offline" is the strongest signal
+        there is -- the broker watched the connection die -- so it wins even if
+        a stale telemetry row would otherwise say STALE. Absence of a last will
+        proves nothing either way, which is exactly why timeouts are still
+        needed underneath it.
+        """
+        if self.link is False and self.link_at >= self.last_seen:
+            return self.set_presence(OFFLINE)
+        if not self.last_seen:
+            # Connected but never sent anything is still UNKNOWN, not OK: the
+            # link being up says nothing about whether data is flowing.
+            return self.set_presence(UNKNOWN)
+        age = now - self.last_seen
+        if age <= offline_after:
+            return self.set_presence(OK)
+        if age <= stale_after:
+            return self.set_presence(STALE)
+        return self.set_presence(OFFLINE)
 
     def to_dict(self, with_history: bool = False) -> Dict[str, Any]:
         # Pose is still ingested and kept on the Robot (the DB layer wants it),
@@ -132,8 +184,10 @@ class Robot:
         d = {
             "id": self.id,
             "name": self.name,
-            "state": "offline" if not self.online else self.state,
+            "state": self.state if self.presence == OK else self.presence,
             "online": self.online,
+            "presence": self.presence,
+            "link": self.link,
             "battery": self.battery,
             "vel": {"v": round(self.v, 3), "w": round(self.w, 3)},
             "mission": self.mission,
@@ -156,9 +210,16 @@ class Robot:
 
 class FleetState:
     def __init__(self, offline_after: float = 6.0,
-                 history_len: int = HISTORY_LEN):
+                 history_len: int = HISTORY_LEN,
+                 stale_after: Optional[float] = None):
         self.robots: Dict[str, Robot] = {}
         self.offline_after = offline_after
+        # How long silence stays merely suspicious before it is called offline.
+        # Default 10x the online window: long enough that a slow link or a
+        # restarting agent does not read as a dead robot, short enough that a
+        # genuinely dead one does not sit in STALE all day.
+        self.stale_after = float(stale_after if stale_after is not None
+                                 else offline_after * 10)
         self.history_len = max(int(history_len), 2)
         self.msg_count = 0
         self.msg_bytes = 0
@@ -173,24 +234,31 @@ class FleetState:
         self.msg_bytes += raw_size
         return robot
 
-    def set_presence(self, robot_id: str, online: bool) -> None:
-        """Driven by MQTT last-will topics (`fleet/<id>/lwt`)."""
+    def set_link(self, robot_id: str, up: bool) -> None:
+        """Record what the last-will topic said. Not the final word on its own.
+
+        A last will only reports the *connection*. It cannot report an agent
+        that is still connected but has stopped forwarding, and it never
+        arrives at all if the broker itself restarted. So this stores the
+        signal and lets evaluate() weigh it against the timeouts.
+        """
         robot = self.robots.get(robot_id)
         if robot is None:
             robot = self.robots[robot_id] = Robot(robot_id, self.history_len)
-        if not online:
-            robot.mark_offline()
-        else:
-            robot.online = True
-            robot.rev += 1
+        robot.link = bool(up)
+        robot.link_at = time.time()
+        robot.evaluate(time.time(), self.offline_after, self.stale_after)
+
+    # Old name; several call sites and tests still use it.
+    def set_presence(self, robot_id: str, online: bool) -> None:
+        self.set_link(robot_id, online)
 
     def reap(self) -> List[str]:
-        """Flip robots to offline once telemetry goes stale. Returns changed ids."""
-        cutoff = time.time() - self.offline_after
+        """Re-evaluate every robot's presence. Returns the ids that changed."""
+        now = time.time()
         changed = []
         for robot in self.robots.values():
-            if robot.online and robot.last_seen < cutoff:
-                robot.mark_offline()
+            if robot.evaluate(now, self.offline_after, self.stale_after):
                 changed.append(robot.id)
         return changed
 
@@ -200,12 +268,16 @@ class FleetState:
 
     def summary(self) -> Dict[str, Any]:
         robots = list(self.robots.values())
-        online = [r for r in robots if r.online]
+        online = [r for r in robots if r.presence == OK]
         batts = [r.battery for r in online if r.battery is not None]
         return {
             "total": len(robots),
             "online": len(online),
-            "offline": len(robots) - len(online),
+            # Broken out rather than lumped into one "offline" count: a stale
+            # robot needs a different response from one that cleanly went away.
+            "stale": sum(1 for r in robots if r.presence == STALE),
+            "unknown": sum(1 for r in robots if r.presence == UNKNOWN),
+            "offline": sum(1 for r in robots if r.presence == OFFLINE),
             "moving": sum(1 for r in online if abs(r.v) > 0.02 or abs(r.w) > 0.02),
             "charging": sum(1 for r in online if r.state == "charging"),
             "faulted": sum(1 for r in online if r.errors or r.state in ("error", "estop")),

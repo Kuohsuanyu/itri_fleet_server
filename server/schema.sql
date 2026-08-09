@@ -76,7 +76,11 @@ CREATE TABLE IF NOT EXISTS topic_samples (
     ts        timestamptz NOT NULL,
     topic     text        NOT NULL,
     num       real,
-    payload   jsonb
+    payload   jsonb,
+    -- 0 = the value changed, 1 = an unchanged value resent as a heartbeat.
+    -- Without this, on_change_only makes "reading is steady" and "sensor
+    -- stopped reporting" produce exactly the same rows: none.
+    flag      smallint    NOT NULL DEFAULT 0
 ) PARTITION BY RANGE (ts);
 
 CREATE INDEX IF NOT EXISTS idx_tsm_robot_topic ON topic_samples (robot_id, topic, ts DESC);
@@ -92,6 +96,10 @@ CREATE TABLE IF NOT EXISTS topic_catalog (
     last_seen  timestamptz NOT NULL DEFAULT now(),
     samples    bigint      NOT NULL DEFAULT 0,
     last_value text,
+    -- last_seen moves on every sample; last_changed only when the value
+    -- actually differs. A topic with a recent last_seen and an old
+    -- last_changed is healthy and steady; one where both are old is silent.
+    last_changed timestamptz,
     PRIMARY KEY (robot_id, topic)
 );
 
@@ -116,7 +124,7 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     robot_id    text,                      -- NULL = every robot
     source      text    NOT NULL,          -- field | topic | presence
     key         text    NOT NULL,          -- 'battery' | 'chassis/bat_pct' | ''
-    op          text    NOT NULL,          -- lt gt outside inside eq ne offline
+    op          text    NOT NULL,          -- lt gt outside inside eq ne offline stale
     value       real,
     value2      real,                      -- upper bound for outside/inside
     text_value  text,                      -- for eq/ne against strings
@@ -174,5 +182,22 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     key   text PRIMARY KEY,
     value text NOT NULL
 );
-INSERT INTO schema_meta (key, value) VALUES ('version', '1')
-    ON CONFLICT (key) DO NOTHING;
+INSERT INTO schema_meta (key, value) VALUES ('version', '2')
+    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+
+
+-- ---------------------------------------------------------------------------
+-- Migrations
+--
+-- Everything above is CREATE TABLE IF NOT EXISTS, which does nothing at all to
+-- a table that already exists -- including not adding new columns. A database
+-- created before a column was introduced would keep working right up until the
+-- first COPY that mentions it, and then every flush would fail.
+--
+-- So each added column gets an explicit, idempotent ALTER here. This whole file
+-- is executed on every startup, so these must stay safe to re-run forever.
+-- ---------------------------------------------------------------------------
+
+-- v2: distinguish a value that changed from one resent as a heartbeat.
+ALTER TABLE topic_samples ADD COLUMN IF NOT EXISTS flag smallint NOT NULL DEFAULT 0;
+ALTER TABLE topic_catalog ADD COLUMN IF NOT EXISTS last_changed timestamptz;

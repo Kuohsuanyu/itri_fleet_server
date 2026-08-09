@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from pywebpush import WebPushException, webpush
 
+from . import state as state_mod
+
 log = logging.getLogger("alerts")
 
 OPS_NUMERIC = {"lt", "gt", "outside", "inside"}
@@ -90,7 +92,7 @@ class AlertEngine:
         """(numeric, raw) for this rule's subject, or (None, None) if absent."""
         src, key = rule["source"], rule["key"]
         if src == "presence":
-            return (0.0 if robot.online else 1.0), robot.online
+            return (0.0 if robot.online else 1.0), robot.presence
         if src == "field":
             raw = {
                 "battery": robot.battery, "state": robot.state,
@@ -111,8 +113,16 @@ class AlertEngine:
                    robot, clearing: bool) -> bool:
         op = rule["op"]
         if op == "offline":
+            # Fires for anything that is not demonstrably OK, including STALE
+            # and UNKNOWN. "Not reporting" is the condition worth waking up
+            # for; which flavour of not-reporting is detail for the message.
             age = time.time() - robot.last_seen if robot.last_seen else 1e9
-            return (not robot.online) or age > float(rule["value"] or 60)
+            return robot.presence != state_mod.OK or age > float(rule["value"] or 60)
+        if op == "stale":
+            # Narrower and more interesting: the link looks fine but the data
+            # stopped. This is the failure that a boolean online/offline model
+            # cannot express at all.
+            return robot.presence == state_mod.STALE
         if op == "eq":
             return str(raw) == str(rule["text_value"])
         if op == "ne":
@@ -152,7 +162,13 @@ class AlertEngine:
                             rule["name"], exc)
 
         if op == "offline":
-            return f"{robot.name} 離線"
+            label = {state_mod.STALE: "資料停止(連線仍在)",
+                     state_mod.UNKNOWN: "從未回報",
+                     state_mod.OFFLINE: "離線"}.get(robot.presence, "離線")
+            return f"{robot.name} {label}"
+        if op == "stale":
+            age = int(time.time() - robot.last_seen) if robot.last_seen else 0
+            return f"{robot.name} 連線仍在但已 {age} 秒沒有資料"
         if op == "lt":
             return f"{robot.name} {subject}={shown} 低於 {rule['value']}"
         if op == "gt":

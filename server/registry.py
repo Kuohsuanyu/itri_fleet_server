@@ -209,22 +209,27 @@ class Registry:
     def known_ids(self) -> List[str]:
         return sorted(self._cache)
 
+    # Publish-only. There is no subscribe leaf at all: this system monitors and
+    # does not command, so the downlink was removed rather than left unused.
+    # An unused capability is still a capability -- anyone who took over the
+    # server could have started sending on fleet/<id>/cmd, and every agent was
+    # already subscribed and waiting. Deleting it means a compromised server
+    # can corrupt records but cannot move a vehicle.
+    PUBLISH_LEAVES = ("status", "lwt", "samples", "raw")
+
     @staticmethod
     def topic_allowed(username: str, topic: str, action: str) -> bool:
         """Each robot is confined to its own branch of the topic tree.
 
         Without this, an authenticated robot could publish as any other robot
-        and the archive would stop being evidence. Wildcards are rejected
-        outright for subscribers so nobody can fish with `fleet/+/status`.
+        and the archive would stop being evidence. Subscription is denied
+        outright, which also disposes of wildcard fishing (`fleet/+/status`).
         """
-        if not username:
+        if not username or action != "publish":
             return False
         parts = topic.split("/")
         if len(parts) != 3 or parts[0] != "fleet" or parts[1] != username:
             return False
-        if action == "publish":
-            # raw = batches of the vehicle's own topics, relayed by itri-agent
-            return parts[2] in ("status", "lwt", "raw")
-        if action == "subscribe":
-            return parts[2] == "cmd"
-        return False
+        # samples = batches of the vehicle's own topics, relayed by itri-agent.
+        # raw is the pre-rename name, accepted so an older agent keeps working.
+        return parts[2] in Registry.PUBLISH_LEAVES

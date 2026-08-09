@@ -62,13 +62,16 @@ def _numeric(value: Any) -> Optional[float]:
 class TelemetryWriter:
     def __init__(self, db: Database, flush_interval: float = 1.0,
                  buffer_max: int = 200_000, event_buffer_max: int = 20_000,
-                 topic_buffer_max: int = 400_000):
+                 topic_buffer_max: int = 400_000,
+                 disk_warn_pct: float = 15.0, disk_critical_pct: float = 5.0,
+                 maintenance_interval: float = 3600.0):
         self.db = db
         self.flush_interval = max(float(flush_interval), 0.2)
         self.buffer: Deque[tuple] = deque(maxlen=buffer_max)
         self.events: Deque[tuple] = deque(maxlen=event_buffer_max)
         self.topics: Deque[tuple] = deque(maxlen=topic_buffer_max)
-        self._catalog: Dict[tuple, list] = {}   # (robot,topic) -> [count, last]
+        # (robot, topic) -> [count, last_value, last_seen, last_changed]
+        self._catalog: Dict[tuple, list] = {}
         self.topics_written = 0
         self._last_state: Dict[str, str] = {}
         self._last_errors: Dict[str, Tuple[str, ...]] = {}
@@ -81,6 +84,13 @@ class TelemetryWriter:
         self.last_flush_ms = 0.0
         self.last_flush_at = 0.0
         self._tasks: List[asyncio.Task] = []
+
+        self.disk_warn_pct = float(disk_warn_pct)
+        self.disk_critical_pct = float(disk_critical_pct)
+        self.maintenance_interval = max(float(maintenance_interval), 60.0)
+        self.disk: Dict[str, Any] = {}
+        self.emergency_drops = 0
+        self._disk_warned = False
 
     # ------------------------------------------------------------- recording
 
@@ -114,11 +124,17 @@ class TelemetryWriter:
                 self.note_event(robot.id, "error", {"cleared": True}, "info")
 
     def record_topics(self, robot_id: str, batch: list) -> None:
-        """A relayed batch of the vehicle's own topics: [[topic, ts, value], ...].
+        """A relayed batch: [[topic, ts, value, flag], ...] (flag optional).
 
-        Values arrive as whatever the onboard broker published. A bare number is
-        stored in `num` so it can be charted from an indexed column; anything
-        else lands in `payload` as jsonb. Nothing is interpreted or discarded.
+        Values arrive as whatever the source published. A bare number is stored
+        in `num` so it can be charted from an indexed column; anything else
+        lands in `payload` as jsonb. Nothing is interpreted or discarded.
+
+        flag 0 = the value changed, 1 = an unchanged value resent as a
+        heartbeat. Storing it is what lets a query distinguish "this reading
+        has not moved" from "this sensor stopped reporting" -- with
+        on_change_only those look identical otherwise. Rows from agents that
+        predate the flag are recorded as changes, which is what they were.
         """
         now = time.time()
         for item in batch:
@@ -130,17 +146,25 @@ class TelemetryWriter:
             if not isinstance(topic, str) or not topic:
                 self.dropped += 1
                 continue
+            try:
+                flag = int(item[3]) if len(item) > 3 else 0
+            except (TypeError, ValueError):
+                flag = 0
 
             num = _numeric(value)
 
             if len(self.topics) == self.topics.maxlen:
                 self.dropped += 1
             self.topics.append((robot_id, _ts(float(ts) if ts else now),
-                                topic[:500], num, Jsonb(value)))
+                                topic[:500], num, Jsonb(value), flag))
 
-            seen = self._catalog.setdefault((robot_id, topic[:500]), [0, ""])
+            seen = self._catalog.setdefault((robot_id, topic[:500]),
+                                            [0, "", 0.0, 0.0])
             seen[0] += 1
             seen[1] = str(value)[:200]
+            seen[2] = float(ts) if ts else now                 # last_seen
+            if flag == 0:
+                seen[3] = float(ts) if ts else now             # last_changed
 
     def note_event(self, robot_id: Optional[str], kind: str,
                    detail: Optional[Dict[str, Any]] = None,
@@ -168,8 +192,9 @@ class TelemetryWriter:
         self.events.clear()
         topic_batch = list(self.topics)
         self.topics.clear()
-        catalog = [(rid, topic, n, last)
-                   for (rid, topic), (n, last) in self._catalog.items()]
+        catalog = [(rid, topic, n, last, seen, changed)
+                   for (rid, topic), (n, last, seen, changed)
+                   in self._catalog.items()]
         self._catalog.clear()
 
         try:
@@ -195,8 +220,8 @@ class TelemetryWriter:
             self.buffer.extendleft(reversed(batch))
             self.events.extendleft(reversed(ev_batch))
             self.topics.extendleft(reversed(topic_batch))
-            for rid, topic, n, last in catalog:
-                self._catalog[(rid, topic)] = [n, last]
+            for rid, topic, n, last, seen, changed in catalog:
+                self._catalog[(rid, topic)] = [n, last, seen, changed]
             log.warning("flush failed (%d telemetry + %d topic rows re-queued): %s",
                         len(batch), len(topic_batch), exc)
             return
@@ -215,18 +240,63 @@ class TelemetryWriter:
                 log.exception("flush loop error")
 
     async def _maintenance_loop(self) -> None:
-        """Roll partitions forward and drop expired ones. Hourly is plenty."""
+        """Roll partitions forward, drop expired ones, watch the disk.
+
+        Hourly for partitions; the disk is checked every cycle too, because
+        retention alone does not bound the disk. Retention bounds *time*. If
+        the incoming rate doubles, or someone relays a 1 kHz topic, 31 days of
+        data is simply twice as large, and the first symptom of that is
+        PostgreSQL refusing writes.
+        """
         while True:
             try:
                 if self.db.ready:
                     await self.db.ensure_partitions()
                     await self.db.drop_expired_partitions()
-                await asyncio.sleep(3600)
+                    await self._check_disk()
+                await asyncio.sleep(self.maintenance_interval)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("partition maintenance error")
                 await asyncio.sleep(300)
+
+    async def _check_disk(self) -> None:
+        info = await self.db.disk()
+        if not info:
+            return
+        self.disk = info
+        free = info["free_pct"]
+
+        if free <= self.disk_critical_pct:
+            # Shed one day at a time, re-measuring after each. Dropping
+            # everything down to the target in one pass would happily delete a
+            # week because the space had not been reclaimed yet mid-loop.
+            dropped = await self.db.emergency_drop_oldest_day()
+            if dropped:
+                self.emergency_drops += 1
+                log.error("DISK CRITICAL %.1f%% free -- dropped %s",
+                          free, ", ".join(dropped))
+                self.note_event(None, "disk",
+                                {"msg": "磁碟空間危急,已刪除最舊一天的資料",
+                                 "free_pct": free, "dropped": dropped},
+                                "critical")
+            else:
+                log.error("DISK CRITICAL %.1f%% free and nothing left to drop",
+                          free)
+                self.note_event(None, "disk",
+                                {"msg": "磁碟空間危急,但已經沒有可刪的分割",
+                                 "free_pct": free}, "critical")
+        elif free <= self.disk_warn_pct:
+            # Warn once per crossing, not once per hour forever.
+            if not self._disk_warned:
+                self._disk_warned = True
+                log.warning("disk low: %.1f%% free on %s", free, info["path"])
+                self.note_event(None, "disk",
+                                {"msg": "磁碟空間偏低", "free_pct": free,
+                                 "path": info["path"]}, "warning")
+        else:
+            self._disk_warned = False
 
     def start(self) -> None:
         self._tasks = [asyncio.create_task(self._flush_loop()),
@@ -248,6 +318,10 @@ class TelemetryWriter:
         return {
             "db_ready": self.db.ready,
             "db_error": self.db.last_error,
+            "disk": self.disk,
+            "disk_warn_pct": self.disk_warn_pct,
+            "disk_critical_pct": self.disk_critical_pct,
+            "emergency_drops": self.emergency_drops,
             "buffered": len(self.buffer),
             "buffer_max": self.buffer.maxlen,
             "buffer_pct": round(len(self.buffer) / self.buffer.maxlen * 100, 1),

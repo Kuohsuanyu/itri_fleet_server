@@ -53,9 +53,33 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "deadband": 0.0,            # numeric: skip if |new-old| <= this
     "max_payload_bytes": 8192,  # anything larger is dropped and counted
 
+    # With on_change_only, a topic that stops changing and a topic that stops
+    # existing look identical from the server. Resending an unchanged value
+    # this often separates them: rows still arriving = source alive, no rows =
+    # source gone. Set 0 to disable (and lose that distinction).
+    "heartbeat_s": 60,
+
     "publish_hz": 1.0,          # uplink batch rate
     "max_batch": 500,
     "buffer_max": 200000,       # samples held while the uplink is down
+
+    # Also publish the batch to the old fleet/<id>/raw topic. Only needed while
+    # a server predates the raw -> samples rename; it doubles this stream.
+    "legacy_raw_topic": True,
+
+    # Unfiltered recording on the vehicle's own disk. The uplink is throttled
+    # and deduplicated by design, so the server's archive is a summary; this is
+    # where the actual signal lives when you need to debug at full rate.
+    #   rate_hz 0 -> record everything, no sampling
+    #   max_gb    -> oldest files are deleted past this, so it cannot fill the SD card
+    "record": {
+        "enabled": False,
+        "dir": "~/.itri-fleet/recordings",
+        "rate_hz": 0,
+        "rotate_mb": 64,
+        "max_gb": 5,
+        "compress": True,
+    },
 
     # Optional: light up the dashboard's standard cards. Purely cosmetic --
     # everything is archived under its original topic either way.
@@ -63,12 +87,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 
+def defaults() -> Dict[str, Any]:
+    """A fresh deep copy of the defaults, untouched by any saved config."""
+    return json.loads(json.dumps(DEFAULT_CONFIG))
+
+
 def _ensure_home() -> None:
     HOME.mkdir(parents=True, exist_ok=True)
 
 
 def load_config() -> Dict[str, Any]:
-    cfg = json.loads(json.dumps(DEFAULT_CONFIG))   # deep copy of the defaults
+    cfg = defaults()
     if CONFIG_PATH.exists():
         stored = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         for key, value in stored.items():

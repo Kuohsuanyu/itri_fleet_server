@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -175,6 +177,85 @@ class Database:
             days_ahead = self.partition_days_ahead
         return await asyncio.to_thread(self._ensure_partitions_sync, days_ahead)
 
+    # ------------------------------------------------------------ disk guard
+
+    def _data_dir_sync(self) -> Optional[str]:
+        with self._pool.connection() as conn:
+            row = conn.execute("SHOW data_directory").fetchone()
+        return row[0] if row else None
+
+    def _disk_sync(self) -> Dict[str, Any]:
+        """Free space on whatever volume PostgreSQL actually writes to.
+
+        Asking the database rather than assuming: the data directory is often
+        on a different volume from the application, and guarding the wrong one
+        is the same as not guarding at all.
+        """
+        path = self._data_dir_sync()
+        target = path if path and os.path.isdir(path) else os.getcwd()
+        usage = shutil.disk_usage(target)
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT pg_database_size(current_database())").fetchone()
+        return {
+            "path": target,
+            "total": usage.total,
+            "free": usage.free,
+            "used": usage.used,
+            "free_pct": round(usage.free / usage.total * 100, 1) if usage.total else 0.0,
+            "db_bytes": int(row[0]) if row else 0,
+        }
+
+    async def disk(self) -> Dict[str, Any]:
+        if not self.ready:
+            return {}
+        try:
+            return await asyncio.to_thread(self._disk_sync)
+        except Exception as exc:
+            log.warning("disk check failed: %s", exc)
+            return {}
+
+    def _oldest_partition_sync(self) -> Optional[str]:
+        """The oldest daily partition, or None if only the default remains."""
+        oldest = None
+        with self._pool.connection() as conn:
+            for parent in self.PARTITIONED:
+                rows = conn.execute("""
+                    SELECT c.relname FROM pg_class c
+                    JOIN pg_inherits i ON i.inhrelid = c.oid
+                    JOIN pg_class p ON p.oid = i.inhparent
+                    WHERE p.relname = %s AND c.relname ~ '_[0-9]{8}$'
+                    ORDER BY c.relname LIMIT 1
+                """, (parent,)).fetchall()
+                if rows:
+                    day = rows[0][0][-8:]
+                    if oldest is None or day < oldest:
+                        oldest = day
+        return oldest
+
+    def _drop_day_sync(self, day: str) -> List[str]:
+        dropped = []
+        with self._pool.connection() as conn:
+            for parent in self.PARTITIONED:
+                name = f"{parent}_{day}"
+                conn.execute(f"DROP TABLE IF EXISTS {name}")
+                dropped.append(name)
+        return dropped
+
+    async def emergency_drop_oldest_day(self) -> List[str]:
+        """Shed one day of history to buy time. Last resort, and it is lossy.
+
+        Losing the oldest day is bad. A full disk is worse: PostgreSQL stops
+        accepting writes, and on the same volume as the OS it can take the
+        whole machine down. Between "lose the oldest day" and "lose the ability
+        to record anything at all", this picks the first -- and logs an event
+        so the loss is never silent.
+        """
+        day = await asyncio.to_thread(self._oldest_partition_sync)
+        if not day:
+            return []
+        return await asyncio.to_thread(self._drop_day_sync, day)
+
     def _drop_expired_sync(self) -> List[str]:
         cutoff = datetime.now(timezone.utc).date() - timedelta(days=self.retention_days)
         dropped = []
@@ -225,9 +306,11 @@ class Database:
     def _copy_topics_sync(self, rows: Sequence[tuple]) -> int:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
-                with cur.copy("COPY topic_samples (robot_id, ts, topic, num, payload)"
+                with cur.copy("COPY topic_samples"
+                              " (robot_id, ts, topic, num, payload, flag)"
                               " FROM STDIN (FORMAT BINARY)") as cp:
-                    cp.set_types(["text", "timestamptz", "text", "real", "jsonb"])
+                    cp.set_types(["text", "timestamptz", "text", "real",
+                                  "jsonb", "int2"])
                     for row in rows:
                         cp.write_row(row)
         return len(rows)
@@ -242,12 +325,20 @@ class Database:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.executemany("""
-                    INSERT INTO topic_catalog (robot_id, topic, samples, last_value, last_seen)
-                    VALUES (%s, %s, %s, %s, now())
+                    INSERT INTO topic_catalog
+                        (robot_id, topic, samples, last_value,
+                         last_seen, last_changed)
+                    VALUES (%s, %s, %s, %s, to_timestamp(%s), to_timestamp(%s))
                     ON CONFLICT (robot_id, topic) DO UPDATE
                     SET samples    = topic_catalog.samples + EXCLUDED.samples,
                         last_value = EXCLUDED.last_value,
-                        last_seen  = now()
+                        last_seen  = EXCLUDED.last_seen,
+                        -- only advance last_changed when this flush actually
+                        -- contained a change; a flush of pure heartbeats has
+                        -- 0 here and must leave the old value alone
+                        last_changed = GREATEST(
+                            topic_catalog.last_changed,
+                            NULLIF(EXCLUDED.last_changed, to_timestamp(0)))
                 """, rows)
         return len(rows)
 

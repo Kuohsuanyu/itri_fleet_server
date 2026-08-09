@@ -1,0 +1,105 @@
+// ITRI Fleet — Tailscale 存取控制政策
+//
+// 貼到 Tailscale 後台 → Access Controls,取代預設的那份。
+// 預設政策是 `"acls": [{"action":"accept","src":["*"],"dst":["*:*"]}]` ——
+// 也就是「tailnet 內任何裝置可以連任何裝置的任何 port」。那對車隊來說太寬:
+// 一台被入侵的車就能連到其他車、連到 PostgreSQL、連到管理介面、SSH 進伺服器。
+//
+// 這份政策把車輛限制成「只能連伺服器的 MQTT port,其他什麼都不行」。
+//
+// ── 套用前先確認 ──────────────────────────────────────────────────────────
+// 1. 伺服器節點必須有 tag:fleet-server(見下方 tagOwners),否則你會把自己鎖在外面
+// 2. 你自己的電腦/手機要留在 autogroup:member,才進得去管理介面
+// 3. Tailscale 後台有 Preview 功能,套用前先看它算出來的結果
+//
+// ── 這份政策擋掉什麼 ──────────────────────────────────────────────────────
+//   車 → 車            擋掉。一台車被入侵不會變成整個車隊被入侵
+//   車 → PostgreSQL    擋掉。車輛沒有任何理由直接碰資料庫
+//   車 → 管理介面 8081 擋掉。車輛只需要 MQTT,登記完成後連 HTTP 都不需要
+//   車 → SSH           擋掉
+//   車 → 網際網路      不受影響(這份政策只管 tailnet 內部)
+//
+// 注意:這是 tailnet 層的限制,和伺服器自己的 MQTT 帳密與 topic ACL 是
+// 兩層獨立的防線。這一層擋「封包能不能到達」,那一層擋「到達後能做什麼」。
+{
+  // ── 誰可以貼哪些 tag ───────────────────────────────────────────────────
+  // tag 一旦貼上,那台裝置就不再屬於某個使用者,金鑰也不會 180 天過期。
+  // 車輛一定要用 tag,否則半年後會無預警斷線。
+  "tagOwners": {
+    "tag:robot":        ["autogroup:admin"],
+    "tag:fleet-server": ["autogroup:admin"],
+  },
+
+  // ── 具名的埠與群組,讓下面的規則讀得懂 ───────────────────────────────
+  "hosts": {},
+
+  "acls": [
+    // 車輛:只能連伺服器的 MQTT。就這一條。
+    //
+    // 沒有 dst 是 tag:robot 的規則 —— 車和車之間完全不通。這是最重要的一條,
+    // 因為車輛實體上最容易被接觸到(插 USB、拔 SD 卡、接上工程網路),
+    // 而且數量最多。任何一台被拿下,能碰到的只有這個 port。
+    {
+      "action": "accept",
+      "src":    ["tag:robot"],
+      "dst":    ["tag:fleet-server:1883"],
+    },
+
+    // 管理者:完整存取伺服器。
+    // 8081 是管理與登記(私有 listener),8080 是儀表板,5432 是資料庫,
+    // 22 是 SSH。這些都只有你進得去。
+    {
+      "action": "accept",
+      "src":    ["autogroup:member"],
+      "dst":    ["tag:fleet-server:22,1883,5432,8080,8081"],
+    },
+
+    // 管理者也需要能連自己的其他裝置(筆電 ↔ 手機之類)。
+    // 如果不需要,刪掉這條會更嚴格。
+    {
+      "action": "accept",
+      "src":    ["autogroup:member"],
+      "dst":    ["autogroup:self:*"],
+    },
+
+    // 管理者要能 SSH 進車輛除錯。
+    // 這是單向的:你連得到車,車連不到你。
+    // 如果你的車是完全不用維護的,刪掉這條。
+    {
+      "action": "accept",
+      "src":    ["autogroup:member"],
+      "dst":    ["tag:robot:22"],
+    },
+  ],
+
+  // ── SSH 進車輛時要重新認證 ─────────────────────────────────────────────
+  // check = 每 12 小時要在瀏覽器重新確認一次身分。
+  // 就算你的筆電被偷,對方也不能直接 SSH 進整個車隊。
+  "ssh": [
+    {
+      "action": "check",
+      "src":    ["autogroup:member"],
+      "dst":    ["tag:robot", "tag:fleet-server"],
+      "users":  ["autogroup:nonroot", "root"],
+      "checkPeriod": "12h",
+    },
+  ],
+
+  // ── 測試:讓 Tailscale 在你按下 Save 時自動驗證這些斷言 ────────────────
+  // 任何一條不成立就拒絕儲存。這比「套用後再手動試試看」可靠得多,
+  // 尤其是 deny 的部分 —— 手動測試很容易忘記測「不該通的有沒有真的不通」。
+  "tests": [
+    {
+      "src": "tag:robot",
+      "accept": ["tag:fleet-server:1883"],
+      "deny": [
+        "tag:fleet-server:5432",   // 資料庫
+        "tag:fleet-server:8080",   // 儀表板
+        "tag:fleet-server:8081",   // 管理與登記
+        "tag:fleet-server:22",     // SSH
+        "tag:robot:22",            // 車連車
+        "tag:robot:1883",
+      ],
+    },
+  ],
+}

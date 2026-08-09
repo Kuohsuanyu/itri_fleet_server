@@ -1,9 +1,24 @@
 """End-to-end check of the registry + enrollment flow."""
 import sys, json, httpx
+from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-B = "http://127.0.0.1:8080"
-ADMIN = {"Authorization": "Bearer itri"}
+# Admin and enrollment answer only on the private listener now, so the test has
+# to reach them the same way an operator does. Read the ports from the running
+# config rather than hard-coding: getting this wrong would make the test pass
+# against the public port, which is precisely the thing that must not work.
+import os, yaml
+_cfg = yaml.safe_load(open(Path(__file__).resolve().parent.parent / "config.yaml",
+                           encoding="utf-8"))
+_priv = _cfg["http"].get("private_port")
+_host = _cfg["http"].get("private_host") or "127.0.0.1"
+if str(_host).lower() == "tailscale":
+    import socket
+    _host = next((a for a in socket.gethostbyname_ex(socket.gethostname())[2]
+                  if a.startswith("100.")), "127.0.0.1")
+PUBLIC = f"http://127.0.0.1:{_cfg['http']['port']}"
+B = f"http://{_host}:{_priv}" if _priv else PUBLIC
+ADMIN = {"Authorization": "Bearer " + str(_cfg["http"]["password"])}
 c = httpx.Client(timeout=20.0)
 ok = fail = 0
 
@@ -109,6 +124,23 @@ for path in ("/admin/robots", "/admin/topics", "/admin/alerts",
              "/static/admin.css", "/static/style.css"):
     r = c.get(f"{B}{path}", headers=ADMIN)
     check(path, r.status_code == 200, f"-> {r.status_code}, {len(r.content)} bytes")
+
+print("\n=== 9. 公開 port 不得暴露管理面(Funnel 指向那裡)===")
+if _priv:
+    for path in ("/admin", "/admin/robots", "/api/admin/robots", "/api/enroll",
+                 "/agent/latest.whl"):
+        r = c.get(f"{PUBLIC}{path}", headers=ADMIN)
+        # 404 而不是 401/403:公開的呼叫者連「這個路徑存在」都不該知道。
+        # 密碼保護是「答對才給」,這一層是「根本沒有這個門」。
+        check(f"公開 port {path} -> 404", r.status_code == 404, f"-> {r.status_code}")
+    # Deliberately not in XXXX-XXXX-XXXX shape: the secret scanner matches that
+    # pattern, and a test fixture that trips it trains people to ignore hits.
+    r = c.post(f"{PUBLIC}/api/enroll", json={"token": "not-a-real-token"})
+    check("公開 port 不能拿來猜授權碼", r.status_code == 404, f"-> {r.status_code}")
+    r = c.get(f"{PUBLIC}/", headers=ADMIN)
+    check("公開 port 仍然提供儀表板", r.status_code == 200, f"-> {r.status_code}")
+else:
+    print("  (private_port 未設定,略過)")
 
 print(f"\n{'='*46}\n通過 {ok} / {ok+fail}\n{'='*46}")
 sys.exit(1 if fail else 0)

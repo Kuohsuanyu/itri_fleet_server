@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import OrderedDict
 from typing import Callable, Optional
 
 import paho.mqtt.client as mqtt
@@ -39,7 +40,8 @@ class TelemetryRouter:
     def __init__(self, state: FleetState,
                  on_sample: Optional[Callable[[object], None]] = None,
                  on_presence: Optional[Callable[[str, bool], None]] = None,
-                 on_raw: Optional[Callable[[str, list], None]] = None):
+                 on_raw: Optional[Callable[[str, list], None]] = None,
+                 dedup_window: int = 4096):
         self.state = state
         self.on_sample = on_sample
         self.on_presence = on_presence
@@ -49,6 +51,16 @@ class TelemetryRouter:
         self.raw_batches = 0
         self.raw_samples = 0
 
+        # (robot_id, boot_id, seq) seen recently. An OrderedDict used as a
+        # bounded FIFO set: redelivery happens within seconds of the original,
+        # so a window of a few thousand batches is far more than enough, and
+        # bounding it means a long-running server cannot leak memory here.
+        self._recent: "OrderedDict[tuple, None]" = OrderedDict()
+        self.dedup_window = max(int(dedup_window), 64)
+        self.duplicates = 0
+        self.duplicate_samples = 0
+        self.unversioned = 0        # batches from agents predating the envelope
+
     def handle(self, topic: str, payload: bytes) -> None:
         parts = topic.split("/")
         if len(parts) < 3:
@@ -57,15 +69,17 @@ class TelemetryRouter:
 
         if kind == "lwt":
             text = payload.decode("utf-8", "replace").strip().strip('"').lower()
-            online = text in ("online", "1", "true", "up")
-            was = robot_id in self.state.robots and self.state.robots[robot_id].online
-            self.state.set_presence(robot_id, online)
-            if self.on_presence and was != online:
-                self.on_presence(robot_id, online)
+            up = text in ("online", "1", "true", "up")
+            existing = self.state.robots.get(robot_id)
+            was = existing.presence if existing else None
+            self.state.set_link(robot_id, up)
+            now = self.state.robots[robot_id].presence
+            if self.on_presence and was != now:
+                self.on_presence(robot_id, now == "ok")
             return
 
-        if kind == "raw":
-            self._apply_raw(robot_id, payload)
+        if kind in ("samples", "raw"):
+            self._apply_samples(robot_id, payload)
             return
 
         if kind != "status":
@@ -89,13 +103,17 @@ class TelemetryRouter:
         if self.on_sample:
             self.on_sample(robot)
 
-    def _apply_raw(self, robot_id: str, payload: bytes) -> None:
+    def _apply_samples(self, robot_id: str, payload: bytes) -> None:
         """A batch of the vehicle's own topics, relayed verbatim by itri-agent.
 
-        Shape: {"b": [[topic, ts, value], ...]}  -- positional to keep the
-        uplink small; a batch of 200 samples is mostly topic strings otherwise.
-        Nothing here interprets the topics; that mapping happens server-side,
-        once per chassis model.
+        Shape: {"v":1, "id":..., "boot":..., "seq":n, "ts":..., "b":[[topic, ts,
+        value, flag], ...]} -- rows are positional to keep the uplink small; a
+        batch of 200 samples is mostly topic strings otherwise. Nothing here
+        interprets the topics; that mapping happens server-side, once per
+        chassis model.
+
+        Old agents send a bare {"b": [...]} with 3-element rows and no
+        envelope; those are accepted, they just cannot be deduplicated.
         """
         try:
             data = json.loads(payload.decode("utf-8"))
@@ -106,6 +124,26 @@ class TelemetryRouter:
         if not isinstance(batch, list):
             self.dropped += 1
             return
+
+        if isinstance(data, dict):
+            boot = data.get("boot")
+            seq = data.get("seq")
+            if boot is not None and seq is not None:
+                # MQTT QoS 1 is at-least-once: a reconnect part way through a
+                # publish redelivers the whole batch. Without this the same
+                # samples land in the archive twice and every count, average or
+                # rate computed over them is wrong -- silently, because
+                # duplicate rows look exactly like real ones.
+                key = (robot_id, str(boot), int(seq))
+                if key in self._recent:
+                    self.duplicates += 1
+                    self.duplicate_samples += len(batch)
+                    return
+                self._recent[key] = None
+                while len(self._recent) > self.dedup_window:
+                    self._recent.popitem(last=False)
+            else:
+                self.unversioned += 1
 
         self.raw_batches += 1
         self.raw_samples += len(batch)

@@ -20,6 +20,19 @@ http:
   # null = wide open (localhost testing only).
   password: CHANGE_ME
   session_days: 30        # how long a successful login is remembered
+
+  # Two listeners, two exposure levels.
+  #   port          public. Tailscale Funnel points here. Dashboard only.
+  #   private_port  admin, enrollment, agent wheel. Bound to the Tailscale
+  #                 address, so it is not routable from the internet at all.
+  # Anything under /admin, /api/admin, /api/enroll or /agent/ returns 404 on
+  # the public port -- not 401, so a public caller cannot even confirm it
+  # exists. Set private_port to null to serve everything on one port (the old
+  # behaviour, which leaves /admin reachable through Funnel).
+  # Every vehicle joins the tailnet before it enrolls, so nothing legitimate
+  # needs enrollment to be public.
+  private_port: 8081
+  private_host: tailscale
   max_attempts: 10        # failed logins allowed per window, then 429
   attempt_window_min: 5
 
@@ -52,12 +65,25 @@ mqtt:
   password: null
   topic: fleet/+/status
   lwt_topic: fleet/+/lwt
-  raw_topic: fleet/+/raw     # itri-agent relays the vehicle's own topics here
-  command_topic: fleet/{id}/cmd
+  # itri-agent relays the vehicle's own topics here. Named `samples`, not
+  # `raw`: the stream is throttled and deduplicated by the agent, so it is a
+  # summary of the source. Genuinely unfiltered data stays on the vehicle
+  # (agent config `record.enabled`).
+  samples_topic: fleet/+/samples
+  # The pre-rename name. Keep it subscribed while any vehicle still runs an
+  # older agent; set to null once they are all updated.
+  legacy_raw_topic: fleet/+/raw
+  # No command topic. This system does not actuate -- see server/registry.py
+  # topic_allowed(), which denies MQTT subscription outright.
 
 dashboard:
   push_hz: 1.0           # WebSocket frames per second (the main egress knob)
-  offline_after: 6.0     # seconds without telemetry before a robot goes grey
+  offline_after: 6.0     # seconds without telemetry before a robot goes STALE
+  # Silence past offline_after is STALE -- suspicious, connection may be fine.
+  # Silence past this is OFFLINE -- concluded. null = 10x offline_after.
+  # A last-will "offline" jumps straight to OFFLINE regardless; these timeouts
+  # exist because a last will never fires when the agent is alive but stuck.
+  stale_after: null
   history_points: 240    # per-robot trail kept in memory (sparklines)
   ws_ping_s: 20          # WebSocket keepalive
 
@@ -76,6 +102,14 @@ database:
   topic_buffer_max: 400000   # relayed topic rows held if the DB goes away
   event_buffer_max: 20000
   partition_days_ahead: 2    # create daily partitions this far in advance
+  # Retention caps how much *time* is kept, not how many bytes. Double the
+  # ingest rate and 31 days is twice the size -- so the disk needs its own
+  # floor. Below warn: an event and a log line. Below critical: the oldest
+  # daily partition is dropped, one per cycle, and that loss is logged as a
+  # critical event. Losing the oldest day beats PostgreSQL refusing writes.
+  disk_warn_pct: 15.0
+  disk_critical_pct: 5.0
+  maintenance_interval_s: 3600
 
 alerts:
   enabled: true

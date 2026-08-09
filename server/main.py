@@ -51,7 +51,11 @@ log = logging.getLogger("fleet")
 
 DEFAULTS: Dict[str, Any] = {
     "http": {"host": "0.0.0.0", "port": 8080, "password": None,
-             "session_days": 30, "max_attempts": 10, "attempt_window_min": 5},
+             "session_days": 30, "max_attempts": 10, "attempt_window_min": 5,
+             # Second listener for admin + enrollment. 0/null = one listener
+             # for everything, which puts /admin behind Funnel.
+             "private_port": 8081,
+             "private_host": "tailscale"},
     "mqtt": {
         "embedded": True,
         "host": "127.0.0.1",
@@ -63,12 +67,18 @@ DEFAULTS: Dict[str, Any] = {
         "password": None,
         "topic": "fleet/+/status",
         "lwt_topic": "fleet/+/lwt",
-        "raw_topic": "fleet/+/raw",
-        "command_topic": "fleet/{id}/cmd",
+        # `raw` was a misnomer -- this stream is throttled and deduplicated,
+        # so it is a summary, not raw. Both names are subscribed so an agent
+        # that predates the rename keeps working.
+        "samples_topic": "fleet/+/samples",
+        "legacy_raw_topic": "fleet/+/raw",
     },
     "dashboard": {
         "push_hz": 4.0,
         "offline_after": 6.0,
+        # Silence beyond offline_after is STALE (suspicious); beyond this it is
+        # OFFLINE (concluded). null -> 10x offline_after.
+        "stale_after": None,
         "history_points": 240,      # per-robot trail kept in memory
         "ws_ping_s": 20,            # WebSocket keepalive
     },
@@ -87,6 +97,11 @@ DEFAULTS: Dict[str, Any] = {
         "topic_buffer_max": 400000,     # relayed topic rows held if the DB is down
         "event_buffer_max": 20000,
         "partition_days_ahead": 2,      # create partitions this far in advance
+        # Retention bounds time, not bytes. If the ingest rate grows, 31 days
+        # simply becomes larger, and a full volume stops PostgreSQL writing.
+        "disk_warn_pct": 15.0,       # log + event, once per crossing
+        "disk_critical_pct": 5.0,    # drop the oldest day, one day per cycle
+        "maintenance_interval_s": 3600,
     },
 }
 
@@ -143,17 +158,24 @@ def tailscale_ip() -> Optional[str]:
 
 def resolve_placeholders(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """`tailscale` in an address field means "whatever this host's tailnet IP is"."""
-    mq = cfg["mqtt"]
-    for key in ("bind", "public_host"):
-        if str(mq.get(key)).lower() == "tailscale":
-            ip = tailscale_ip()
-            if ip:
-                mq[key] = ip
-                log.info("mqtt.%s = %s (detected Tailscale address)", key, ip)
-            else:
-                log.error("mqtt.%s: 'tailscale' requested but no 100.x address found "
-                          "-- is Tailscale connected?", key)
-                mq[key] = "0.0.0.0" if key == "bind" else None
+    for section, key, fallback in (("mqtt", "bind", "0.0.0.0"),
+                                   ("mqtt", "public_host", None),
+                                   ("http", "private_host", "127.0.0.1")):
+        node = cfg[section]
+        if str(node.get(key)).lower() != "tailscale":
+            continue
+        ip = tailscale_ip()
+        if ip:
+            node[key] = ip
+            log.info("%s.%s = %s (detected Tailscale address)", section, key, ip)
+        else:
+            # For private_host the fallback is loopback, never 0.0.0.0: if the
+            # tailnet address cannot be found, binding the admin surface to
+            # every interface would put it on the office LAN. Unreachable is
+            # the safe failure here.
+            log.error("%s.%s: 'tailscale' requested but no 100.x address found "
+                      "-- is Tailscale connected?", section, key)
+            node[key] = fallback
     return cfg
 
 
@@ -189,7 +211,9 @@ SESSIONS: Dict[str, float] = {}
 ATTEMPTS: Dict[str, List[float]] = {}
 
 state = FleetState(offline_after=float(CFG["dashboard"]["offline_after"]),
-                   history_len=int(CFG["dashboard"]["history_points"]))
+                   history_len=int(CFG["dashboard"]["history_points"]),
+                   stale_after=float(CFG["dashboard"].get("stale_after") or
+                                     float(CFG["dashboard"]["offline_after"]) * 10))
 meter = EgressMeter()
 broker: Optional[MqttBroker] = None
 ingest: Optional[MqttIngest] = None
@@ -336,7 +360,11 @@ async def lifespan(app: FastAPI):
         writer = TelemetryWriter(db, flush_interval=float(dbc["flush_interval_s"]),
                                  buffer_max=int(dbc["buffer_max"]),
                                  event_buffer_max=int(dbc["event_buffer_max"]),
-                                 topic_buffer_max=int(dbc["topic_buffer_max"]))
+                                 topic_buffer_max=int(dbc["topic_buffer_max"]),
+                                 disk_warn_pct=float(dbc.get("disk_warn_pct", 15)),
+                                 disk_critical_pct=float(dbc.get("disk_critical_pct", 5)),
+                                 maintenance_interval=float(
+                                     dbc.get("maintenance_interval_s", 3600)))
         writer.start()
         writer.note_event(None, "system", {"msg": "server started"}, "info")
         registry = Registry(db, cache_ttl=float(CFG["registry"]["credential_cache_s"]))
@@ -373,7 +401,9 @@ async def lifespan(app: FastAPI):
         # loopback paho client
         broker.subscribe_inproc(mq["topic"], router.handle)
         broker.subscribe_inproc(mq["lwt_topic"], router.handle)
-        broker.subscribe_inproc(mq["raw_topic"], router.handle)
+        broker.subscribe_inproc(mq["samples_topic"], router.handle)
+        if mq.get("legacy_raw_topic"):
+            broker.subscribe_inproc(mq["legacy_raw_topic"], router.handle)
         log.info("ingest: in-process from embedded broker (%s, %s)",
                  mq["topic"], mq["lwt_topic"])
     else:
@@ -413,6 +443,42 @@ app = FastAPI(title="Fleet Server", version="1.0", lifespan=lifespan,
 # same per-IP counter as failed logins.
 OPEN_PATHS = {"/healthz", "/login", "/logout", "/favicon.ico", "/api/enroll"}
 OPEN_PREFIXES = ("/agent/",)     # wheel download; contains no secrets
+
+# Paths that must never be answerable through Funnel.
+#
+# The dashboard is the only thing that has any business being on the public
+# internet. Administration, enrollment and the agent wheel are all operator
+# surfaces, reached from inside the tailnet -- and every vehicle is already on
+# the tailnet before it enrolls, so nothing legitimate is lost.
+#
+# The password already guards these. That is not the same protection: a
+# password holds until the first authentication bug, a missing route holds
+# regardless. Enrollment in particular is unauthenticated by construction --
+# the one-time token IS the credential -- so leaving it exposed to the whole
+# internet means anyone can grind tokens.
+PRIVATE_PREFIXES = ("/admin", "/api/admin", "/api/enroll", "/agent/",
+                    "/api/system", "/api/db", "/api/events", "/api/alerts",
+                    "/api/topics", "/api/rules", "/api/push")
+
+PRIVATE_PORT = int(CFG["http"].get("private_port") or 0)
+PRIVATE_HOST = CFG["http"].get("private_host") or "127.0.0.1"
+
+
+def is_private_path(path: str) -> bool:
+    return path == "/admin" or path.startswith(PRIVATE_PREFIXES)
+
+
+def arrived_privately(request: Request) -> bool:
+    """True when the request came in on the private listener.
+
+    Decided by the local port the connection landed on, not by a header. A
+    header would be attacker-controlled; the listening port is a property of
+    the socket and cannot be spoofed by the client.
+    """
+    if not PRIVATE_PORT:
+        return True                      # single-listener mode: no separation
+    server = request.scope.get("server") or (None, None)
+    return server[1] == PRIVATE_PORT
 
 
 def new_session() -> str:
@@ -476,6 +542,13 @@ def authed(request: Request) -> bool:
 @app.middleware("http")
 async def gate_and_meter(request: Request, call_next):
     path = request.url.path
+
+    # Surface check first: a public caller must not even learn that /admin
+    # exists, so this returns 404 rather than 401/403.
+    if is_private_path(path) and not arrived_privately(request):
+        meter.add_http(200)
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
+
     is_open = path in OPEN_PATHS or path.startswith(OPEN_PREFIXES)
     if PASSWORD and not is_open and not authed(request):
         wants_html = "text/html" in request.headers.get("accept", "")
@@ -597,6 +670,15 @@ async def api_metrics():
         "error": ingest.last_error if ingest else None,
         "accepted": router.accepted,
         "dropped": router.dropped,
+        "batches": router.raw_batches,
+        "batch_samples": router.raw_samples,
+        # QoS 1 redeliveries caught by (robot, boot, seq). A number that keeps
+        # climbing means the uplink is flapping, which is worth seeing.
+        "duplicate_batches": router.duplicates,
+        "duplicate_samples": router.duplicate_samples,
+        # Batches from agents predating the envelope -- these cannot be
+        # deduplicated, so a non-zero value here is a fleet-upgrade to-do.
+        "unversioned_batches": router.unversioned,
         "broker_stats": broker.stats if broker else None,
     }
     snap["history"] = writer.stats() if writer else {"enabled": False}
@@ -1103,7 +1185,7 @@ async def api_enroll(request: Request, body: Dict[str, Any]):
         "port": int(mq["port"]),
         "status_topic": f"fleet/{result['robot_id']}/status",
         "lwt_topic": f"fleet/{result['robot_id']}/lwt",
-        "cmd_topic": f"fleet/{result['robot_id']}/cmd",
+        "samples_topic": f"fleet/{result['robot_id']}/samples",
     }
     return result
 
@@ -1166,15 +1248,12 @@ async def api_storage():
     return stats
 
 
-@app.post("/api/command/{robot_id}")
-async def api_command(robot_id: str, body: Dict[str, Any]):
-    """Publish a command back down to one robot on `fleet/<id>/cmd`."""
-    if broker is None:
-        raise HTTPException(503, "commands require the embedded broker")
-    topic = CFG["mqtt"]["command_topic"].format(id=robot_id)
-    payload = json.dumps(body, separators=(",", ":")).encode()
-    await broker.publish(topic, payload, qos=1, retain=False)
-    return {"ok": True, "topic": topic, "bytes": len(payload)}
+# There is deliberately no command endpoint. This system observes; it does not
+# actuate. `fleet/<id>/cmd` and POST /api/command used to exist and were never
+# used, which is the worst of both: no feature, full attack surface. Anyone who
+# reached the admin API could have driven a vehicle. Both are gone, and
+# Registry.topic_allowed now denies subscription outright, so a compromised
+# server can corrupt records but cannot move anything.
 
 
 @app.get("/api/bwtest")
@@ -1214,11 +1293,45 @@ app.mount("/static", StaticFiles(directory=WEB), name="static")
 
 
 def main() -> None:
-    uvicorn.run(app, host=CFG["http"]["host"], port=int(CFG["http"]["port"]),
-                log_level="warning",
-                ws_ping_interval=float(CFG["dashboard"]["ws_ping_s"]),
-                ws_ping_timeout=float(CFG["dashboard"]["ws_ping_s"]),
-                access_log=False)
+    """Serve the app on one or two listeners.
+
+    Two, when `http.private_port` is set. The public listener carries only the
+    dashboard; administration and enrollment answer solely on the private one,
+    which binds the Tailscale address. Funnel is pointed at the public port, so
+    the private surface is not merely password-protected from the internet --
+    it is not routable from it.
+
+    This is worth the extra socket because the two surfaces have genuinely
+    different exposure. A password is one bug away from being bypassed; an
+    interface that never receives the packet is not.
+    """
+    ws_ping = float(CFG["dashboard"]["ws_ping_s"])
+    common = dict(log_level="warning", ws_ping_interval=ws_ping,
+                  ws_ping_timeout=ws_ping, access_log=False)
+    public_port = int(CFG["http"]["port"])
+
+    if not PRIVATE_PORT:
+        log.warning("single listener: /admin and /api/enroll are reachable "
+                    "through Funnel. Set http.private_port to separate them.")
+        uvicorn.run(app, host=CFG["http"]["host"], port=public_port, **common)
+        return
+
+    async def serve_both() -> None:
+        servers = [
+            uvicorn.Server(uvicorn.Config(
+                app, host=CFG["http"]["host"], port=public_port, **common)),
+            # lifespan off on the second: startup would otherwise run twice and
+            # the embedded broker would try to bind 1883 from both.
+            uvicorn.Server(uvicorn.Config(
+                app, host=PRIVATE_HOST, port=PRIVATE_PORT,
+                lifespan="off", **common)),
+        ]
+        log.info("public  :%d  dashboard only (Funnel points here)", public_port)
+        log.info("private %s:%d  admin + enrollment (tailnet only)",
+                 PRIVATE_HOST, PRIVATE_PORT)
+        await asyncio.gather(*(s.serve() for s in servers))
+
+    asyncio.run(serve_both())
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ failure paths, not the happy path.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import json
 import sys
 import time
@@ -76,11 +77,43 @@ def sub_result(client, topic, timeout=4.0):
     return got.get("rc", "timeout")
 
 
+def _cfg():
+    import yaml
+    return yaml.safe_load(
+        open(Path(__file__).resolve().parent.parent / "config.yaml",
+             encoding="utf-8"))
+
+
+def _default_admin_url() -> str:
+    """Admin and enrollment live on the private listener.
+
+    Read it from the running config instead of hard-coding a port, so this
+    test cannot quietly start passing against the public surface -- which is
+    exactly the thing that must not be reachable.
+    """
+    c = _cfg()["http"]
+    if not c.get("private_port"):
+        return f"http://127.0.0.1:{c['port']}"
+    host = c.get("private_host") or "127.0.0.1"
+    if str(host).lower() == "tailscale":
+        import socket
+        host = next((a for a in socket.gethostbyname_ex(socket.gethostname())[2]
+                     if a.startswith("100.")), "127.0.0.1")
+    return f"http://{host}:{c['private_port']}"
+
+
+def _default_password() -> str:
+    return str(_cfg()["http"]["password"])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--credentials", default="sim_creds.json")
-    ap.add_argument("--server", default="http://127.0.0.1:8080")
-    ap.add_argument("--password", default="itri")
+    # Admin and enrollment live on the private listener. Default to whatever
+    # the running config says rather than a fixed port, so this test cannot
+    # quietly start passing against the public surface.
+    ap.add_argument("--server", default=_default_admin_url())
+    ap.add_argument("--password", default=_default_password())
     args = ap.parse_args()
     for s in (sys.stdout, sys.stderr):
         try:
@@ -138,8 +171,13 @@ def main() -> int:
     check("不存在的 evil 車輛沒有被建立",
           not any(r["id"] == "evil" for r in fleet["robots"]))
 
-    check("可訂閱自己的 cmd", sub_result(ca_client, f"fleet/{a}/cmd") == 0)
+    # The cmd downlink was removed: this fleet is monitored, never commanded.
+    # Robots are publish-only now, so even their own former cmd topic must be
+    # refused -- otherwise a compromised server could still drive them.
+    check("訂閱自己的 cmd 也被拒(下行已移除)",
+          sub_result(ca_client, f"fleet/{a}/cmd") == 128)
     check("訂閱他車 cmd 被拒", sub_result(ca_client, f"fleet/{b}/cmd") == 128)
+    check("訂閱自己的 samples 被拒", sub_result(ca_client, f"fleet/{a}/samples") == 128)
     check("萬用字元訂閱被拒", sub_result(ca_client, "fleet/+/status") == 128)
     check("全域萬用字元被拒", sub_result(ca_client, "#") == 128)
 

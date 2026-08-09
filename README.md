@@ -204,16 +204,74 @@ sudo systemctl enable --now itri-agent
 
 詳見 [itri_fleet_agent](https://github.com/Kuohsuanyu/itri_fleet_agent)。
 
+### 公開與私有:兩個 port
+
+Funnel 把 HTTP 服務推上公開網際網路。所以只有儀表板放在那裡:
+
+| | port | 綁在 | 內容 |
+|---|---|---|---|
+| 公開 | 8080 | 0.0.0.0 | 儀表板、WebSocket、登入 |
+| 私有 | 8081 | Tailscale 位址 | 管理、登記、agent wheel |
+
+公開 port 上 `/admin`、`/api/admin`、`/api/enroll`、`/agent/` 一律回 **404**
+—— 不是 401。公開的呼叫者連「這裡有管理介面」都不該知道。
+
+判斷依據是連線落在哪個 port,不是 header —— header 客戶端可以偽造,
+監聽的 port 不行。
+
+`/api/enroll` 特別需要這樣:它**照設計就不需要認證**(一次性授權碼本身就是
+憑證)。放在公開網路上等於讓全世界來猜授權碼。而車輛在登記前**早就已經在
+tailnet 上了**,根本不需要走公開路徑。
+
+```bash
+tailscale funnel status     # 必須指向 8080
+```
+
+管理頁的網址是 `http://<你的tailnet位址>:8081/admin/robots`,
+或用 MagicDNS `http://itri:8081/admin/robots`。
+
+把 `http.private_port` 設成 `null` 會退回單一 port(舊行為),啟動時會警告。
+
+### Tailscale ACL —— 記得套用
+
+`docs/tailscale-acl.hujson` 把車輛限制成**只能連伺服器的 1883**。
+車連不到車、連不到 PostgreSQL、連不到管理介面、SSH 不進伺服器。
+
+Tailscale 的預設政策是「任何裝置連任何裝置的任何 port」,對車隊太寬 ——
+車輛是最容易被實體接觸的,拿下一台就等於拿到整個 tailnet。
+
+**這要你手動貼到後台**(Access Controls),程式碼改不了它。
+政策檔裡附了 tests 區塊,按 Save 時會自動驗證「不該通的有沒有真的不通」。
+套用前先按 Preview,貼錯會把自己鎖在外面。
+
 ### 授權碼只用一次
 
 | 情況 | 要重新認證? | 資料缺口 |
 |---|---|---|
 | 網路斷、伺服器重啟 | 不用,自動重連 | **0 秒**(agent 緩衝) |
+| 資料庫掛掉 | 不用 | **0 秒**(伺服器緩衝) |
 | 車子重開機 | 不用,讀本機憑證 | 停機那段 |
+| **agent 行程死掉** | 不用 | **等於死掉的時間** |
 | 管理員按「撤銷」 | 要,重發授權碼 | — |
 
-實測:伺服器停 21 秒 → 資料零缺口;agent 自己死 10 秒 → 缺 10 秒。
-**這就是 systemd 自動重啟的價值。**
+實測:伺服器停 21 秒 → 零缺口;資料庫停 25 秒 → 零缺口;
+agent 自己死 10 秒 → **缺 10.13 秒**。
+
+最後一列沒有任何機制能救:緩衝在 agent 裡面,agent 死了緩衝也死了。
+`itri-agent install-service`(Restart=always,RestartSec=10)把缺口壓到
+重啟時間,但**不是零**。所以它不是可選項。
+
+### 重複資料
+
+MQTT QoS 1 是 at-least-once。重連時整批會被重送,而重送的列**看起來
+跟真的一模一樣** —— 之後任何 count、avg、速率計算都是錯的,而且不會有
+人發現。
+
+agent 每批帶 `boot_id` + `seq`,伺服器用 `(robot_id, boot, seq)` 去重,
+在寫進資料庫**之前**擋掉。`/api/metrics` 的 `mqtt.duplicate_batches`
+會告訴你擋了多少 —— 這個數字一直爬代表上行在抖。
+
+`unversioned_batches` 是還沒升級的舊 agent 送的,那些**無法去重**。
 
 ---
 

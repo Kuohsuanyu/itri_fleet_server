@@ -5,7 +5,7 @@ renderShell('預警規則');
 
 const OP_TEXT = {
   lt: '小於', gt: '大於', outside: '超出範圍', inside: '落在範圍',
-  eq: '等於', ne: '不等於', offline: '離線超過',
+  eq: '等於', ne: '不等於', offline: '離線超過', stale: '資料停止',
 };
 
 let liveValues = {};   // robot_id -> {field/topic -> value}, for the preview
@@ -13,6 +13,7 @@ let liveValues = {};   // robot_id -> {field/topic -> value}, for the preview
 function describeRule(r) {
   const subject = r.source === 'presence' ? '上下線' : (r.key || '?');
   if (r.op === 'offline') return `離線超過 ${r.value ?? 60}s`;
+  if (r.op === 'stale') return '連線仍在但資料停止';
   if (r.op === 'eq' || r.op === 'ne') return `${subject} ${OP_TEXT[r.op]} "${r.text_value}"`;
   if (r.op === 'outside' || r.op === 'inside')
     return `${subject} ${OP_TEXT[r.op]} ${r.value}~${r.value2}`;
@@ -116,7 +117,8 @@ function showPreview() {
   let out;
   if (!tpl) {
     const op = $('r-op').value;
-    out = op === 'offline' ? `${vars.robot} 離線`
+    out = op === 'stale' ? `${vars.robot} 連線仍在但資料停止`
+        : op === 'offline' ? `${vars.robot} 離線`
       : op === 'outside' ? `${vars.robot} ${key}=${value} 超出範圍 ${vars.limit}~${vars.limit2}`
       : `${vars.robot} ${key}=${value} ${OP_TEXT[op] || op} ${vars.limit}`;
     $('r-preview').textContent = '預覽(自動產生):' + out;
